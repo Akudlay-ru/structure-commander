@@ -73,7 +73,7 @@ module.exports = class StructureCommanderPlugin extends Plugin {
     );
 
     this.addRibbonIcon("list-tree", "Structure Commander", () => {
-      new StructureCommanderModal(this.app, this).open();
+      this.openStructurePanel("right");
     });
 
     // — события —
@@ -134,8 +134,8 @@ module.exports = class StructureCommanderPlugin extends Plugin {
   registerCommands() {
     this.addCommand({
       id: "open-structure-commander",
-      name: "Открыть Structure Commander",
-      callback: () => new StructureCommanderModal(this.app, this).open()
+      name: "Открыть панель структуры",
+      callback: () => this.openStructurePanel("right")
     });
 
     this.addCommand({
@@ -1224,187 +1224,376 @@ module.exports = class StructureCommanderPlugin extends Plugin {
 
   // ─────────────────────── перемещение ветки ───────────────────────
 
+  /**
+   * Перемещение без поиска «своего уровня».
+   *
+   * Базовая логика:
+   *   - обычная строка двигается между соседними строками;
+   *   - выделение двигается как выбранный диапазон строк;
+   *   - ветка заголовка/списка переносится целиком только если строка свёрнута;
+   *   - свёрнутые блоки выше/ниже воспринимаются как один видимый блок.
+   *
+   * Это намеренно НЕ Word-like sibling jump. Иначе снова получаем цирк:
+   * код ищет соседа того же уровня, не находит — и запрещает движение.
+   */
   moveCurrentBranch(direction) {
     const editor = this.getEditor(); if (!editor) return;
 
-    // 1) Есть выделение → двигаем диапазон выделенных строк целиком (как блок).
-    //    Цель — найти соседнюю «ветку того же уровня» относительно граничного заголовка
-    //    выделения, иначе сдвиг на одну строку выше/ниже соседа.
+    let startLine, endLine;
+    let restoreSelection = null;
+
     if (editor.somethingSelected && editor.somethingSelected()) {
       const selFrom = editor.getCursor("from");
       const selTo   = editor.getCursor("to");
-      let startLine = selFrom.line;
-      let endLine   = selTo.line;
-      // Если выделение заканчивается в начале строки (ch === 0) и захватывает >0 строк —
-      // "хвостовая" строка фактически не выделена; стандарт текстовых редакторов.
-      if (selTo.ch === 0 && endLine > startLine) endLine -= 1;
+      startLine = selFrom.line;
+      endLine   = selTo.line;
 
-      this.moveLineRange(editor, startLine, endLine, direction);
-      this.refreshStructurePanels(); this.refreshActiveToolbar();
+      // В Obsidian/CodeMirror выделение целых строк часто приходит как
+      // from: начало первой строки, to: начало строки ПОСЛЕ выделения.
+      // Старый код превращал 3 выделенные строки в диапазон 0..2,
+      // но потом восстанавливал selection до строки 2, ch 0 — то есть уже
+      // только 2 строки. Дальше оно закономерно сжималось до одной.
+      const toIsExclusiveLineStart = selTo.ch === 0 && endLine > startLine;
+      if (toIsExclusiveLineStart) endLine -= 1;
+
+      restoreSelection = {
+        fromCh: selFrom.ch,
+        toCh: selTo.ch,
+        lineCount: endLine - startLine + 1,
+        toIsExclusiveLineStart
+      };
+    } else {
+      const cursor = editor.getCursor();
+      const range = this.computeVisibleMoveRangeAtLine(editor, cursor.line);
+      if (!range) { new Notice("Нечего перемещать"); return; }
+      startLine = range.startLine;
+      endLine   = range.endLine;
+    }
+
+    const neighbor = direction < 0
+      ? this.findPreviousVisibleMoveBlock(editor, startLine)
+      : this.findNextVisibleMoveBlock(editor, endLine);
+
+    if (!neighbor) {
+      new Notice(direction < 0 ? "Уже наверху" : "Уже внизу");
       return;
     }
 
-    // 2) Нет выделения → старая логика: перенос всей ветки относительно соседа того же уровня.
-    const root = this.getCurrentHeading(editor); if (!root) return;
+    const targetLine = direction < 0 ? neighbor.startLine : neighbor.endLine + 1;
+    const newStartLine = this.moveBlock(editor, startLine, endLine, targetLine);
 
-    const headings = this.getHeadings(editor);
-    const cur = this.getBranch(editor, root);
+    if (restoreSelection && newStartLine !== null && typeof editor.setSelection === "function") {
+      const totalAfter = editor.lineCount();
+      let toLine, toCh;
 
-    let sibling = null;
-    if (direction < 0) {
-      for (let i = headings.length - 1; i >= 0; i--) {
-        const h = headings[i];
-        if (h.line >= root.line) continue;
-        if (h.level < root.level) break;
-        if (h.level === root.level) { sibling = h; break; }
+      if (restoreSelection.toIsExclusiveLineStart) {
+        // Для построчного выделения конец должен оставаться на строке ПОСЛЕ
+        // выделенного блока, иначе каждое перемещение будет съедать одну строку.
+        toLine = newStartLine + restoreSelection.lineCount;
+        toCh = 0;
+      } else {
+        toLine = newStartLine + restoreSelection.lineCount - 1;
+        toCh = restoreSelection.toCh;
       }
-      if (!sibling) { new Notice("Нет предыдущей ветки того же уровня"); return; }
-      const sb = this.getBranch(editor, sibling);
-      this.moveBlock(editor, cur.startLine, cur.endLine, sb.startLine);
-      this.refreshStructurePanels(); this.refreshActiveToolbar();
-      new Notice("Ветка перемещена выше");
-      return;
+
+      toLine = clamp(toLine, 0, Math.max(0, totalAfter - 1));
+      editor.setSelection(
+        { line: newStartLine, ch: restoreSelection.fromCh },
+        { line: toLine, ch: toCh }
+      );
     }
 
-    for (let j = 0; j < headings.length; j++) {
-      const h = headings[j];
-      if (h.line <= root.line) continue;
-      if (h.line <= cur.endLine) continue;
-      if (h.level < root.level) break;
-      if (h.level === root.level) { sibling = h; break; }
-    }
-    if (!sibling) { new Notice("Нет следующей ветки того же уровня"); return; }
-    const nb = this.getBranch(editor, sibling);
-    this.moveBlock(editor, cur.startLine, cur.endLine, nb.endLine + 1);
     this.refreshStructurePanels(); this.refreshActiveToolbar();
-    new Notice("Ветка перемещена ниже");
+    new Notice(direction < 0 ? "Перемещено выше" : "Перемещено ниже");
+  }
+
+  /** Совместимость со старым именем. */
+  computeBranchRangeAtLine(editor, line) {
+    return this.computeVisibleMoveRangeAtLine(editor, line);
   }
 
   /**
-   * Перемещает диапазон строк [startLine..endLine] на одну строку
-   * выше/ниже (direction = -1 / +1). Если в диапазоне есть заголовок и
-   * следующая строка тоже заголовок того же уровня — диапазон перепрыгивает
-   * целую соседнюю ветку (соседи переставляются как блоки).
+   * Диапазон перемещения от строки.
+   * Если строка свёрнута — переносим весь скрытый блок.
+   * Если строка не свёрнута — переносим только саму строку.
    */
-  moveLineRange(editor, startLine, endLine, direction) {
+  computeVisibleMoveRangeAtLine(editor, line) {
     const total = editor.lineCount();
-    if (startLine < 0 || endLine >= total || startLine > endLine) return;
+    if (line < 0 || line >= total) return null;
 
-    if (direction < 0) {
-      if (startLine === 0) { new Notice("Уже наверху"); return; }
-      // Если строка startLine — заголовок и строка startLine-1 (или сосед) тоже заголовок —
-      // перепрыгиваем соседнюю ветку. Иначе двигаем на одну строку.
-      const targetLine = this.findMoveTargetUp(editor, startLine);
-      this.moveBlock(editor, startLine, endLine, targetLine);
-      new Notice("Перемещено выше");
-    } else {
-      if (endLine >= total - 1) { new Notice("Уже внизу"); return; }
-      const targetLine = this.findMoveTargetDown(editor, endLine);
-      this.moveBlock(editor, startLine, endLine, targetLine);
-      new Notice("Перемещено ниже");
+    const folded = this.getFoldedLineRangeStartingAt(editor, line);
+    if (folded) return { startLine: folded.startLine, endLine: folded.endLine };
+
+    return { startLine: line, endLine: line };
+  }
+
+  /** Старое имя оставлено, чтобы не ломать возможные внутренние вызовы. */
+  computeWordMoveBlockAtLine(editor, line) {
+    return this.computeVisibleMoveRangeAtLine(editor, line);
+  }
+
+  /**
+   * Предыдущий видимый блок:
+   *   - обычная строка → одна строка;
+   *   - если попали в скрытую часть свёрнутого блока → весь свёрнутый блок;
+   *   - если предыдущая видимая строка сама свёрнута → весь свёрнутый блок.
+   */
+  findPreviousVisibleMoveBlock(editor, startLine) {
+    if (startLine <= 0) return null;
+    let line = startLine - 1;
+
+    const containing = this.getFoldedLineRangeContaining(editor, line);
+    if (containing) return containing;
+
+    const starting = this.getFoldedLineRangeStartingAt(editor, line);
+    if (starting) return starting;
+
+    return { startLine: line, endLine: line };
+  }
+
+  /**
+   * Следующий видимый блок:
+   *   - обычная строка → одна строка;
+   *   - если следующая видимая строка свёрнута → весь свёрнутый блок;
+   *   - если каким-то образом попали внутрь скрытой части → весь соответствующий блок.
+   */
+  findNextVisibleMoveBlock(editor, endLine) {
+    const total = editor.lineCount();
+    if (endLine >= total - 1) return null;
+    let line = endLine + 1;
+
+    const containing = this.getFoldedLineRangeContaining(editor, line);
+    if (containing) return containing;
+
+    const starting = this.getFoldedLineRangeStartingAt(editor, line);
+    if (starting) return starting;
+
+    return { startLine: line, endLine: line };
+  }
+
+  /** Старые имена оставлены как алиасы. */
+  findNextWordMoveBlock(editor, endLine) {
+    return this.findNextVisibleMoveBlock(editor, endLine);
+  }
+
+  findPreviousWordMoveBlock(editor, startLine) {
+    return this.findPreviousVisibleMoveBlock(editor, startLine);
+  }
+
+  getWordOutlineLevel(editor, line) {
+    const h = this.headingAtLine(editor, line);
+    if (h) return h.level;
+
+    const raw = editor.getLine(line);
+    if (raw == null || !raw.trim()) return null;
+
+    const indent = indentWidth((raw.match(/^\s*/) || [""])[0]);
+    return 7 + Math.floor(indent / 2);
+  }
+
+  headingAtLine(editor, line) {
+    const raw = editor.getLine(line) || "";
+    if (!/^#{1,6}\s+/.test(raw)) return null;
+    return this.getHeadings(editor).find((h) => h.line === line) || null;
+  }
+
+  nextNonEmptyLine(editor, fromLine) {
+    for (let i = fromLine; i < editor.lineCount(); i++) {
+      if ((editor.getLine(i) || "").trim()) return i;
+    }
+    return -1;
+  }
+
+  /**
+   * Все свёрнутые диапазоны CodeMirror/Obsidian как диапазоны строк.
+   * Fold обычно начинается на строке-заголовке/родителе и заканчивается
+   * на последней скрытой строке блока.
+   */
+  getFoldedLineRanges(editor) {
+    if (!this.cmLanguage || !editor || !editor.cm || !this.cmLanguage.foldedRanges) return [];
+    if (typeof editor.offsetToPos !== "function" || typeof editor.posToOffset !== "function") return [];
+
+    const total = editor.lineCount();
+    if (total <= 0) return [];
+
+    let from = null, to = null;
+    try {
+      from = editor.posToOffset({ line: 0, ch: 0 });
+      const lastLine = total - 1;
+      to = editor.posToOffset({ line: lastLine, ch: editor.getLine(lastLine).length });
+    } catch (e) { return []; }
+    if (from === null || to === null) return [];
+
+    const ranges = [];
+    try {
+      this.cmLanguage.foldedRanges(editor.cm.state).between(from, to, (a, b) => {
+        try {
+          const p1 = editor.offsetToPos(a);
+          const p2 = editor.offsetToPos(b);
+          if (!p1 || !p2) return;
+          const startLine = p1.line;
+          const endLine = Math.max(p1.line, p2.line);
+          if (endLine > startLine) ranges.push({ startLine, endLine });
+        } catch (e) { /* noop */ }
+      });
+    } catch (e) { return []; }
+
+    ranges.sort((x, y) => x.startLine - y.startLine || x.endLine - y.endLine);
+    return ranges;
+  }
+
+  getFoldedLineRangeStartingAt(editor, line) {
+    const ranges = this.getFoldedLineRanges(editor);
+    for (let i = 0; i < ranges.length; i++) {
+      if (ranges[i].startLine === line) return ranges[i];
+    }
+    return null;
+  }
+
+  getFoldedLineRangeContaining(editor, line) {
+    const ranges = this.getFoldedLineRanges(editor);
+    for (let i = 0; i < ranges.length; i++) {
+      const r = ranges[i];
+      if (line > r.startLine && line <= r.endLine) return r;
+    }
+    return null;
+  }
+
+  /**
+   * Пересчитать номер строки после перемещения блока [startLine..endLine]
+   * в позицию targetLine исходного документа.
+   */
+  mapLineAfterMove(line, startLine, endLine, targetLine, insertAt) {
+    const size = endLine - startLine + 1;
+
+    // Линия была внутри переносимого блока.
+    if (line >= startLine && line <= endLine) {
+      return insertAt + (line - startLine);
+    }
+
+    // Блок ушёл вниз: промежуточные строки поднялись на размер блока.
+    if (targetLine > endLine) {
+      if (line > endLine && line < targetLine) return line - size;
+      return line;
+    }
+
+    // Блок ушёл вверх: промежуточные строки опустились на размер блока.
+    if (targetLine < startLine) {
+      if (line >= targetLine && line < startLine) return line + size;
+      return line;
+    }
+
+    return line;
+  }
+
+  /**
+   * Восстановить fold-диапазоны после полной замены текста.
+   * Без этого CodeMirror теряет свёртку, и повторное нажатие начинает
+   * двигать уже одну строку вместо всей свёрнутой ветки.
+   */
+  restoreFoldedLineRanges(editor, ranges) {
+    if (!ranges || !ranges.length) return false;
+    if (!this.cmLanguage || !editor || !editor.cm || !this.cmLanguage.foldEffect) return false;
+    if (typeof editor.posToOffset !== "function") return false;
+
+    const effects = [];
+    const total = editor.lineCount();
+
+    for (let i = 0; i < ranges.length; i++) {
+      const r = ranges[i];
+      const startLine = clamp(r.startLine, 0, total - 1);
+      const endLine = clamp(r.endLine, 0, total - 1);
+      if (endLine <= startLine) continue;
+
+      try {
+        const from = editor.posToOffset({ line: startLine, ch: editor.getLine(startLine).length });
+        const to = editor.posToOffset({ line: endLine, ch: editor.getLine(endLine).length });
+        if (from !== null && to !== null && to > from) {
+          effects.push(this.cmLanguage.foldEffect.of({ from, to }));
+        }
+      } catch (e) { /* noop */ }
+    }
+
+    if (!effects.length) return false;
+
+    try {
+      editor.cm.dispatch({ effects });
+      return true;
+    } catch (e) {
+      console.error(e);
+      return false;
     }
   }
 
-  findMoveTargetUp(editor, startLine) {
-    const text = editor.getLine(startLine);
-    const m = text.match(/^(#{1,6})(\s+.+)$/);
-    if (m) {
-      // Это заголовок — ищем заголовок того же уровня выше и его branch.startLine.
-      const headings = this.getHeadings(editor);
-      const myLv = m[1].length;
-      let prev = null;
-      for (let i = headings.length - 1; i >= 0; i--) {
-        const h = headings[i];
-        if (h.line >= startLine) continue;
-        if (h.level < myLv) break;
-        if (h.level === myLv) { prev = h; break; }
-      }
-      if (prev) {
-        const pb = this.getBranch(editor, prev);
-        return pb.startLine;
-      }
-    }
-    // обычный текст — на одну строку выше
-    return startLine - 1;
-  }
-
-  findMoveTargetDown(editor, endLine) {
-    // Если последняя строка диапазона — заголовок, то целевая = конец следующей ветки + 1.
-    // Иначе — endLine + 2 (сдвиг на одну строку вниз).
-    const text = editor.getLine(endLine);
-    const m = text.match(/^(#{1,6})(\s+.+)$/);
-    if (m) {
-      const headings = this.getHeadings(editor);
-      const myLv = m[1].length;
-      let next = null;
-      for (let j = 0; j < headings.length; j++) {
-        const h = headings[j];
-        if (h.line <= endLine) continue;
-        if (h.level < myLv) break;
-        if (h.level === myLv) { next = h; break; }
-      }
-      if (next) {
-        const nb = this.getBranch(editor, next);
-        return nb.endLine + 1;
-      }
-    }
-    return endLine + 2;
+  /**
+   * Повторное восстановление fold-state после того, как Obsidian/CodeMirror
+   * закончат обработку курсора и scrollIntoView. Без этого курсор на строке
+   * свёрнутого родителя иногда провоцирует авто-разворачивание уже после нашей
+   * первой попытки восстановить fold. Да, редактор тоже умеет жить своей жизнью.
+   */
+  scheduleRestoreFoldedLineRanges(editor, ranges) {
+    if (!ranges || !ranges.length) return;
+    const copy = ranges.map((r) => ({ startLine: r.startLine, endLine: r.endLine }));
+    const restore = () => {
+      try { this.restoreFoldedLineRanges(editor, copy); }
+      catch (e) { /* noop */ }
+    };
+    setTimeout(restore, 0);
+    setTimeout(restore, 30);
   }
 
   /**
    * Атомарное перемещение [startLine..endLine] так, чтобы НОВАЯ позиция
    * первой строки блока оказалась на месте targetLine исходного документа.
-   *
-   * Реализовано через полную замену объединённого диапазона
-   * [min(srcStart,dstStart)..max(srcEnd,dstEnd)] одной транзакцией.
-   * Это гарантирует:
-   *   - один Ctrl+Z откатывает всё;
-   *   - не появляются лишние пустые строки;
-   *   - корректна работа на границах файла (без финального \n тоже).
    */
   moveBlock(editor, startLine, endLine, targetLine) {
     const total = editor.lineCount();
-    if (startLine < 0 || endLine >= total || startLine > endLine) return;
+    if (startLine < 0 || endLine >= total || startLine > endLine) return null;
     if (targetLine < 0) targetLine = 0;
     if (targetLine > total) targetLine = total;
-    if (targetLine >= startLine && targetLine <= endLine + 1) return; // нет смещения
+    if (targetLine >= startLine && targetLine <= endLine + 1) return startLine;
 
-    // Соберём «строки» как массив, без склейки концов файла
+    // Снимок всех текущих fold-диапазонов до replaceRange. Полная замена текста
+    // сбрасывает fold state, поэтому его надо перенести на новые номера строк.
+    const foldedBefore = this.getFoldedLineRanges(editor);
+
     const allLines = [];
     for (let i = 0; i < total; i++) allLines.push(editor.getLine(i));
 
     const block = allLines.slice(startLine, endLine + 1);
-    const before = allLines.slice(0, startLine);
-    const after  = allLines.slice(endLine + 1);
+    const removed = allLines.slice(0, startLine).concat(allLines.slice(endLine + 1));
 
-    // Склеим до удалённого блока
-    const removed = before.concat(after);
-    // targetLine задавался относительно исходного документа.
-    // Если target идёт ПОСЛЕ удалённого блока, его индекс в removed уменьшится
-    // на размер блока.
     let insertAt = targetLine;
     if (targetLine > endLine) insertAt = targetLine - (endLine - startLine + 1);
     insertAt = clamp(insertAt, 0, removed.length);
 
+    const foldedAfter = foldedBefore.map((r) => {
+      return {
+        startLine: this.mapLineAfterMove(r.startLine, startLine, endLine, targetLine, insertAt),
+        endLine: this.mapLineAfterMove(r.endLine, startLine, endLine, targetLine, insertAt)
+      };
+    }).filter((r) => r.endLine > r.startLine);
+
     const finalLines = removed.slice(0, insertAt).concat(block).concat(removed.slice(insertAt));
 
-    // Заменим всё содержимое одним диапазоном — одна транзакция, один Ctrl+Z.
     const lastLine = total - 1;
-    const lastCh   = editor.getLine(lastLine).length;
+    const lastCh = editor.getLine(lastLine).length;
+    editor.replaceRange(finalLines.join("\n"), { line: 0, ch: 0 }, { line: lastLine, ch: lastCh });
 
-    const newText = finalLines.join("\n");
-    editor.replaceRange(
-      newText,
-      { line: 0, ch: 0 },
-      { line: lastLine, ch: lastCh }
-    );
-
-    // Поставим курсор на начало перемещённого блока
     const cursorLine = clamp(insertAt, 0, finalLines.length - 1);
     editor.setCursor({ line: cursorLine, ch: 0 });
+
     try {
       editor.scrollIntoView({ from: { line: cursorLine, ch: 0 }, to: { line: cursorLine, ch: 0 } }, true);
     } catch (e) { /* noop */ }
+
+    // Восстанавливаем свёртку ПОСЛЕ установки курсора и прокрутки. И затем
+    // повторяем это отложенно, потому что Obsidian может асинхронно раскрыть
+    // fold под курсором уже после replaceRange/setCursor.
+    this.restoreFoldedLineRanges(editor, foldedAfter);
+    this.scheduleRestoreFoldedLineRanges(editor, foldedAfter);
+
+    return cursorLine;
   }
 
   // ─────────────────────── нормализация уровней ───────────────────────
@@ -2130,18 +2319,18 @@ class EditorToolbar {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// StructurePanelView — боковая панель с поиском и фильтром.
-// Уровень заголовка передаётся ВИЗУАЛЬНО (отступ + жирность + цвет),
-// без подписей "H1/H2/...".
+// StructurePanelView — компактная боковая панель структуры.
+// Сделана ближе к встроенной Outline-панели Obsidian: только дерево заголовков,
+// без отдельного пульта, поиска, счётчиков и кнопочного зоопарка.
 // ═══════════════════════════════════════════════════════════════════════════════
 class StructurePanelView extends ItemView {
   constructor(leaf, plugin) {
     super(leaf);
     this.plugin = plugin;
     this.maxLevel = plugin.settings.panelMaxLevel || 6;
-    this.search = "";
     this._readToken = 0;
-    this.scheduleRender = debounce(() => this.render(), 220, true);
+    this.panelCollapsed = new Set(); // локальная свёртка только внутри панели, редактор не трогаем
+    this.scheduleRender = debounce(() => this.render(), 180, true);
   }
 
   getViewType() { return STRUCTURE_PANEL_VIEW; }
@@ -2150,9 +2339,13 @@ class StructurePanelView extends ItemView {
 
   async onOpen() {
     this.render();
-    // Подсветка активной ветки при движении курсора
     this.registerEvent(this.app.workspace.on("editor-change", () => this.scheduleRender()));
     this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.scheduleRender()));
+    this.registerEvent(this.app.workspace.on("file-open", () => this.scheduleRender()));
+    this.registerEvent(this.app.vault.on("modify", (file) => {
+      const cur = this.plugin.getCurrentMarkdownFile();
+      if (cur && file && file.path === cur.path) this.scheduleRender();
+    }));
   }
 
   render() {
@@ -2160,66 +2353,22 @@ class StructurePanelView extends ItemView {
     container.empty();
     container.addClass("structure-panel-root");
 
+    // Локальные стили держим здесь, чтобы main.js можно было заменить одним файлом
+    // без обязательного обновления styles.css. Да, CSS внутри JS выглядит как ремонт
+    // изолентой, зато не ломает установку.
+    this.ensureInlineStyles(container);
+
     const file = this.plugin.getCurrentMarkdownFile();
-
-    // ── header ──
-    const header = container.createDiv({ cls: "structure-panel-header" });
-    header.createDiv({ cls: "structure-panel-title", text: "Структура" });
-
-    const select = header.createEl("select", { cls: "structure-panel-level-select" });
-    [
-      ["1", "До H1"],
-      ["2", "До H2"],
-      ["3", "До H3"],
-      ["4", "До H4"],
-      ["5", "До H5"],
-      ["6", "До H6"],
-      ["all", "Все"]
-    ].forEach((p) => {
-      const o = select.createEl("option");
-      o.value = p[0]; o.text = p[1];
-      if (
-        (p[0] === "all" && this.maxLevel >= 6) ||
-        (p[0] !== "all" && Number(p[0]) === this.maxLevel)
-      ) o.selected = true;
-    });
-    select.addEventListener("change", async () => {
-      this.maxLevel = (select.value === "all") ? 6 : Number(select.value);
-      this.plugin.settings.panelMaxLevel = this.maxLevel;
-      await this.plugin.saveSettings();
-      this.render();
-    });
-
-    const refresh = header.createEl("button", { cls: "structure-panel-icon-btn", text: "↻" });
-    refresh.title = "Обновить";
-    refresh.addEventListener("click", () => this.render());
-
-    const closeBtn = header.createEl("button", { cls: "structure-panel-icon-btn", text: "×" });
-    closeBtn.title = "Скрыть панель";
-    closeBtn.addEventListener("click", () => this.plugin.closeStructurePanel());
-
-    // ── search ──
-    const searchRow = container.createDiv({ cls: "structure-panel-searchrow" });
-    const searchInput = searchRow.createEl("input", { type: "text", cls: "structure-panel-search" });
-    searchInput.placeholder = "Поиск по заголовкам";
-    searchInput.value = this.search;
-    searchInput.addEventListener("input", () => {
-      this.search = searchInput.value || "";
-      this.renderList();
-    });
+    const body = container.createDiv({ cls: "scmd-outline" });
 
     if (!file) {
-      container.createDiv({ cls: "structure-panel-empty", text: "Откройте Markdown-заметку" });
+      body.createDiv({ cls: "scmd-outline-empty", text: "Откройте Markdown-заметку" });
       return;
     }
-
-    const body = container.createDiv({ cls: "structure-panel-body" });
-    body.createDiv({ cls: "structure-panel-file", text: file.name });
 
     this.bodyEl = body;
     this.fileForRender = file;
 
-    // Защита от race condition — увеличиваем токен и ждём только свой результат.
     const myToken = ++this._readToken;
     this.app.vault.cachedRead(file).then((text) => {
       if (myToken !== this._readToken) return;
@@ -2228,34 +2377,105 @@ class StructurePanelView extends ItemView {
     });
   }
 
+  ensureInlineStyles(container) {
+    if (container.querySelector("style[data-scmd-outline-style]")) return;
+    const style = container.createEl("style");
+    style.setAttribute("data-scmd-outline-style", "true");
+    style.textContent = `
+      .structure-panel-root {
+        padding: 0;
+        overflow: hidden;
+      }
+      .structure-panel-root .scmd-outline {
+        height: 100%;
+        overflow: auto;
+        padding: 4px 0 8px 0;
+        font-size: var(--font-ui-small);
+        color: var(--text-normal);
+      }
+      .structure-panel-root .scmd-outline-empty {
+        color: var(--text-muted);
+        padding: 8px 12px;
+      }
+      .structure-panel-root .scmd-outline-list {
+        position: relative;
+        padding: 2px 0;
+      }
+      .structure-panel-root .scmd-outline-item {
+        position: relative;
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        min-height: 22px;
+        line-height: 22px;
+        padding: 0 8px 0 6px;
+        border-radius: var(--radius-s);
+        cursor: pointer;
+        user-select: none;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .structure-panel-root .scmd-outline-item:hover {
+        background: var(--background-modifier-hover);
+      }
+      .structure-panel-root .scmd-outline-item-active {
+        background: var(--background-modifier-hover);
+        color: var(--text-accent);
+      }
+      .structure-panel-root .scmd-outline-toggle {
+        width: 12px;
+        min-width: 12px;
+        color: var(--text-faint);
+        font-size: 11px;
+        text-align: center;
+      }
+      .structure-panel-root .scmd-outline-title {
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .structure-panel-root .scmd-outline-level-1 { padding-left: 4px;  font-weight: 500; }
+      .structure-panel-root .scmd-outline-level-2 { padding-left: 18px; }
+      .structure-panel-root .scmd-outline-level-3 { padding-left: 32px; }
+      .structure-panel-root .scmd-outline-level-4 { padding-left: 46px; }
+      .structure-panel-root .scmd-outline-level-5 { padding-left: 60px; }
+      .structure-panel-root .scmd-outline-level-6 { padding-left: 74px; }
+      .structure-panel-root .scmd-outline-level-2::before,
+      .structure-panel-root .scmd-outline-level-3::before,
+      .structure-panel-root .scmd-outline-level-4::before,
+      .structure-panel-root .scmd-outline-level-5::before,
+      .structure-panel-root .scmd-outline-level-6::before {
+        content: "";
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        width: 1px;
+        background: var(--background-modifier-border);
+        opacity: 0.8;
+      }
+      .structure-panel-root .scmd-outline-level-2::before { left: 10px; }
+      .structure-panel-root .scmd-outline-level-3::before { left: 24px; }
+      .structure-panel-root .scmd-outline-level-4::before { left: 38px; }
+      .structure-panel-root .scmd-outline-level-5::before { left: 52px; }
+      .structure-panel-root .scmd-outline-level-6::before { left: 66px; }
+    `;
+  }
+
   renderList() {
     if (!this.bodyEl) return;
     const body = this.bodyEl;
     const file = this.fileForRender;
     if (!file || !this.allHeadings) return;
 
-    // Очищаем тело, оставляем строку файла
-    const fileLine = body.querySelector(".structure-panel-file");
     body.empty();
-    if (fileLine) body.appendChild(fileLine);
 
     const all = this.allHeadings;
-    let filtered = all.filter((h) => h.level <= this.maxLevel);
-    const q = this.search.trim().toLowerCase();
-    if (q) {
-      filtered = filtered.filter((h) => h.title.toLowerCase().includes(q));
-    }
 
-    // Счётчик
-    const counter = body.createDiv({ cls: "structure-panel-counter" });
-    counter.setText(filtered.length + " / " + all.length);
-
-    if (filtered.length === 0) {
-      body.createDiv({ cls: "structure-panel-empty", text: q ? "Ничего не найдено" : "Нет заголовков" });
+    if (!all.length) {
+      body.createDiv({ cls: "scmd-outline-empty", text: "Нет заголовков" });
       return;
     }
 
-    // Текущий заголовок (для подсветки)
     let activeLine = -1;
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
     if (view && view.file && view.file.path === file.path && view.editor) {
@@ -2263,13 +2483,41 @@ class StructurePanelView extends ItemView {
       if (cur) activeLine = cur.line;
     }
 
-    const list = body.createDiv({ cls: "structure-panel-list" });
+    const list = body.createDiv({ cls: "scmd-outline-list" });
+    const hasChildren = new Set();
+    for (let i = 0; i < all.length - 1; i++) {
+      const h = all[i];
+      const n = all[i + 1];
+      if (n && n.level > h.level) hasChildren.add(h.line);
+    }
 
-    filtered.forEach((h) => {
-      const item = list.createDiv({ cls: "structure-panel-item structure-panel-level-" + h.level });
-      item.setText(h.title || "(без названия)");
-      if (h.line === activeLine) item.addClass("structure-panel-item-active");
+    const visible = this.getPanelVisibleHeadings(all, hasChildren);
+    if (!visible.length) {
+      body.createDiv({ cls: "scmd-outline-empty", text: "Нет заголовков" });
+      return;
+    }
+
+    visible.forEach((h) => {
+      const item = list.createDiv({
+        cls: "scmd-outline-item scmd-outline-level-" + h.level
+      });
+      if (h.line === activeLine) item.addClass("scmd-outline-item-active");
       item.title = "Строка " + (h.line + 1);
+
+      const canCollapse = hasChildren.has(h.line);
+      const isCollapsed = this.isPanelCollapsed(h);
+      const toggle = item.createSpan({ cls: "scmd-outline-toggle" });
+      toggle.setText(canCollapse ? (isCollapsed ? "›" : "⌄") : "");
+      if (canCollapse) {
+        toggle.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          this.togglePanelHeading(h);
+        });
+      }
+
+      item.createSpan({ cls: "scmd-outline-title", text: h.title || "(без названия)" });
+
       item.addEventListener("click", () => this.plugin.jumpToHeading(file, h.line));
       item.addEventListener("contextmenu", (e) => {
         e.preventDefault();
@@ -2278,20 +2526,63 @@ class StructurePanelView extends ItemView {
     });
   }
 
+  panelKey(heading) {
+    const file = this.fileForRender;
+    return (file ? file.path : "") + ":" + heading.line;
+  }
+
+  isPanelCollapsed(heading) {
+    return this.panelCollapsed.has(this.panelKey(heading));
+  }
+
+  togglePanelHeading(heading) {
+    const key = this.panelKey(heading);
+    if (this.panelCollapsed.has(key)) this.panelCollapsed.delete(key);
+    else this.panelCollapsed.add(key);
+    this.renderList();
+  }
+
+  setPanelHeadingCollapsed(heading, collapsed) {
+    const key = this.panelKey(heading);
+    if (collapsed) this.panelCollapsed.add(key);
+    else this.panelCollapsed.delete(key);
+    this.renderList();
+  }
+
+  getPanelVisibleHeadings(all, hasChildren) {
+    const visible = [];
+    const collapsedStack = [];
+
+    for (let i = 0; i < all.length; i++) {
+      const h = all[i];
+
+      while (collapsedStack.length && collapsedStack[collapsedStack.length - 1].level >= h.level) {
+        collapsedStack.pop();
+      }
+
+      const hiddenByPanel = collapsedStack.length > 0;
+      if (!hiddenByPanel && h.level <= this.maxLevel) visible.push(h);
+
+      // Сворачиваем только внутри панели: не вызываем collapseCurrentBranch/expandCurrentBranch
+      // и не меняем fold-состояние редактора.
+      if (!hiddenByPanel && hasChildren.has(h.line) && this.isPanelCollapsed(h)) {
+        collapsedStack.push({ level: h.level, line: h.line });
+      }
+    }
+
+    return visible;
+  }
+
   openItemContextMenu(heading, x, y) {
     const m = new Menu();
     m.addItem((it) => it.setTitle("Перейти").setIcon("arrow-right-circle")
       .onClick(() => this.plugin.jumpToHeading(this.fileForRender, heading.line)));
     m.addSeparator();
-    m.addItem((it) => it.setTitle("Свернуть ветку").onClick(async () => {
-      await this.plugin.jumpToHeading(this.fileForRender, heading.line);
-      await sleep(30);
-      this.plugin.collapseCurrentBranch();
+    m.addItem((it) => it.setTitle("Свернуть в панели").onClick(() => {
+      this.setPanelHeadingCollapsed(heading, true);
     }));
-    m.addItem((it) => it.setTitle("Развернуть ветку").onClick(async () => {
-      await this.plugin.jumpToHeading(this.fileForRender, heading.line);
-      await sleep(30);
-      this.plugin.expandCurrentBranch();
+    m.addItem((it) => it.setTitle("Развернуть в панели").onClick(() => {
+      this.setPanelHeadingCollapsed(heading, false);
     }));
     m.addSeparator();
     m.addItem((it) => it.setTitle("Ветку выше").onClick(async () => {
@@ -2307,12 +2598,12 @@ class StructurePanelView extends ItemView {
     m.addItem((it) => it.setTitle("Повысить").onClick(async () => {
       await this.plugin.jumpToHeading(this.fileForRender, heading.line);
       await sleep(30);
-      this.plugin.shiftCurrentBranch(-1);
+      this.plugin.shiftLineAtCursor(-1);
     }));
     m.addItem((it) => it.setTitle("Понизить").onClick(async () => {
       await this.plugin.jumpToHeading(this.fileForRender, heading.line);
       await sleep(30);
-      this.plugin.shiftCurrentBranch(1);
+      this.plugin.shiftLineAtCursor(1);
     }));
     m.addSeparator();
     m.addItem((it) => it.setTitle("Экспорт ветки…").onClick(async () => {
@@ -2864,6 +3155,10 @@ function uniqueSortedLevels(headings) {
 function sleep(ms) { return new Promise((r) => window.setTimeout(r, ms)); }
 
 function clamp(v, mn, mx) { return Math.max(mn, Math.min(mx, v)); }
+
+function indentWidth(s) {
+  return String(s || "").replace(/\t/g, "    ").length;
+}
 
 function truncate(s, n) {
   s = String(s || "");
