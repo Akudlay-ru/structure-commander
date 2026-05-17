@@ -10,9 +10,14 @@ const {
   PluginSettingTab,
   Setting,
   TFile,
+  TFolder,
   normalizePath,
   debounce
 } = require("obsidian");
+
+let electronClipboard = null, electronShell = null, nodeFs = null, nodePath = null, childProcess = null, os = null;
+try { ({ clipboard: electronClipboard, shell: electronShell } = require("electron")); } catch (e) {}
+try { nodeFs = require("fs"); nodePath = require("path"); childProcess = require("child_process"); os = require("os"); } catch (e) {}
 
 const STRUCTURE_PANEL_VIEW = "structure-commander-panel";
 
@@ -32,7 +37,16 @@ const DEFAULT_SETTINGS = {
   lastPanelSide: "right",
   showEditorToolbar: true,
   toolbarSize: "compact",
-  lastShowToLevel: 1
+  lastShowToLevel: 1,
+  vaultOrderEnabled: true,
+  vaultDryRun: false,
+  vaultNumberingStyle: "decimal_2_underscore",
+  vaultNumberingTargets: "both",
+  vaultNumberingOrder: "folders-first",
+  vaultStripOldNumbering: true,
+  vaultCustomTemplate: "{N}_{title}",
+  vaultCustomZeroPad: 2,
+  vaultCustomMarker: "•"
 };
 
 // Хоткеи по умолчанию.
@@ -56,6 +70,26 @@ const HOTKEY_LABELS_RU = {
   "expand-current-branch":    "Развернуть ветку"
 };
 
+const VAULT_NUMBERING_STYLES = [
+  { id: "none", label: "нет", orderable: false },
+  { id: "decimal_2_underscore", label: "01_Название", orderable: true },
+  { id: "decimal_3_underscore", label: "001_Название", orderable: true },
+  { id: "latin_upper_underscore", label: "A_Название", orderable: true },
+  { id: "latin_lower_underscore", label: "a_Название", orderable: true },
+  { id: "cyrillic_upper_underscore", label: "А_Название", orderable: true },
+  { id: "cyrillic_lower_underscore", label: "а_Название", orderable: true },
+  { id: "roman_upper_underscore", label: "I_Название", orderable: true },
+  { id: "roman_lower_underscore", label: "i_Название", orderable: true },
+  { id: "dash_marker", label: "- Название", orderable: false },
+  { id: "bullet_marker", label: "• Название", orderable: false },
+  { id: "custom", label: "Пользовательский шаблон", orderable: true }
+];
+const VAULT_LATIN_LOWER = "abcdefghijklmnopqrstuvwxyz".split("");
+const VAULT_LATIN_UPPER = VAULT_LATIN_LOWER.map((x) => x.toUpperCase());
+const VAULT_CYRILLIC_LOWER = ["а","б","в","г","д","е","ж","з","и","к","л","м","н","о","п","р","с","т","у","ф","х","ц","ч","ш","щ","э","ю","я"];
+const VAULT_CYRILLIC_UPPER = VAULT_CYRILLIC_LOWER.map((x) => x.toUpperCase());
+
+
 module.exports = class StructureCommanderPlugin extends Plugin {
 
   async onload() {
@@ -64,6 +98,9 @@ module.exports = class StructureCommanderPlugin extends Plugin {
     this.lastMarkdownFilePath = "";
     this.toolbars = new WeakMap();   // MarkdownView -> EditorToolbar
     this._panelReadToken = 0;        // защита от устаревших async-read
+    this.lastVaultTargetPath = "";
+    this.vaultUndoStack = [];
+    this.vaultRedoStack = [];
 
     this.addSettingTab(new StructureCommanderSettingTab(this.app, this));
 
@@ -112,6 +149,13 @@ module.exports = class StructureCommanderPlugin extends Plugin {
       this.buildEditorContextMenu(menu, editor, view);
     }));
 
+    this.registerEvent(this.app.workspace.on("file-menu", (menu, file) => {
+      if (file && file.path) this.lastVaultTargetPath = file.path;
+      this.buildVaultContextMenu(menu, file);
+    }));
+
+    this.registerDomEvent(document, "keydown", (evt) => this.handleVaultUndoRedoKeydown(evt));
+
     // — команды —
     this.registerCommands();
 
@@ -134,8 +178,8 @@ module.exports = class StructureCommanderPlugin extends Plugin {
   registerCommands() {
     this.addCommand({
       id: "open-structure-commander",
-      name: "Открыть панель структуры",
-      callback: () => this.openStructurePanel("right")
+      name: "Открыть Structure Commander",
+      callback: () => new StructureCommanderModal(this.app, this).open()
     });
 
     this.addCommand({
@@ -293,6 +337,15 @@ module.exports = class StructureCommanderPlugin extends Plugin {
       name: "Заменить нумерацию на emoji-цифры…",
       callback: () => this.openRenumberModal("emoji")
     });
+
+    this.addCommand({ id: "renumber-vault-folder", name: "Пронумеровать текущую папку vault…", callback: () => this.openVaultRenumberModal("renumber") });
+    this.addCommand({ id: "remove-vault-numbering", name: "Удалить нумерацию текущей папки vault…", callback: () => this.openVaultRenumberModal("remove") });
+    this.addCommand({ id: "move-vault-item-up", name: "Файл/папка выше", callback: () => this.moveVaultItem(-1) });
+    this.addCommand({ id: "move-vault-item-down", name: "Файл/папка ниже", callback: () => this.moveVaultItem(1) });
+    this.addCommand({ id: "promote-vault-item", name: "Файл/папка на уровень выше", callback: () => this.moveVaultItemOut() });
+    this.addCommand({ id: "demote-vault-item", name: "Файл/папка внутрь предыдущей папки", callback: () => this.moveVaultItemIntoPreviousFolder() });
+    this.addCommand({ id: "undo-vault-operation", name: "Отменить файловую операцию", callback: () => this.undoVaultOperation() });
+    this.addCommand({ id: "redo-vault-operation", name: "Повторить файловую операцию", callback: () => this.redoVaultOperation() });
   }
 
   async saveSettings() {
@@ -617,6 +670,7 @@ module.exports = class StructureCommanderPlugin extends Plugin {
   }
 
   async collapseCurrentBranch() {
+    if (this.isVaultTreeContext()) return this.toggleVaultFolder(false);
     const editor = this.getEditor(); if (!editor) return;
     const heading = this.getCurrentHeading(editor); if (!heading) return;
 
@@ -628,6 +682,7 @@ module.exports = class StructureCommanderPlugin extends Plugin {
   }
 
   async expandCurrentBranch() {
+    if (this.isVaultTreeContext()) return this.toggleVaultFolder(true);
     const editor = this.getEditor(); if (!editor) return;
     const heading = this.getCurrentHeading(editor); if (!heading) return;
 
@@ -857,6 +912,7 @@ module.exports = class StructureCommanderPlugin extends Plugin {
    * соседствующих строк-нумерованных-списков.
    */
   shiftLineAtCursor(delta) {
+    if (this.isVaultTreeContext()) return delta < 0 ? this.moveVaultItemOut() : this.moveVaultItemIntoPreviousFolder();
     const editor = this.getEditor(); if (!editor) return;
 
     // Определяем диапазон строк
@@ -1224,376 +1280,244 @@ module.exports = class StructureCommanderPlugin extends Plugin {
 
   // ─────────────────────── перемещение ветки ───────────────────────
 
-  /**
-   * Перемещение без поиска «своего уровня».
-   *
-   * Базовая логика:
-   *   - обычная строка двигается между соседними строками;
-   *   - выделение двигается как выбранный диапазон строк;
-   *   - ветка заголовка/списка переносится целиком только если строка свёрнута;
-   *   - свёрнутые блоки выше/ниже воспринимаются как один видимый блок.
-   *
-   * Это намеренно НЕ Word-like sibling jump. Иначе снова получаем цирк:
-   * код ищет соседа того же уровня, не находит — и запрещает движение.
-   */
   moveCurrentBranch(direction) {
+    if (this.isVaultTreeContext()) return this.moveVaultItem(direction);
     const editor = this.getEditor(); if (!editor) return;
 
-    let startLine, endLine;
-    let restoreSelection = null;
-
+    // 1) Есть выделение → двигаем диапазон выделенных строк целиком (как блок).
+    //    Цель — найти соседнюю «ветку того же уровня» относительно граничного заголовка
+    //    выделения, иначе сдвиг на одну строку выше/ниже соседа.
     if (editor.somethingSelected && editor.somethingSelected()) {
       const selFrom = editor.getCursor("from");
       const selTo   = editor.getCursor("to");
-      startLine = selFrom.line;
-      endLine   = selTo.line;
+      let startLine = selFrom.line;
+      let endLine   = selTo.line;
+      // Если выделение заканчивается в начале строки (ch === 0) и захватывает >0 строк —
+      // "хвостовая" строка фактически не выделена; стандарт текстовых редакторов.
+      if (selTo.ch === 0 && endLine > startLine) endLine -= 1;
 
-      // В Obsidian/CodeMirror выделение целых строк часто приходит как
-      // from: начало первой строки, to: начало строки ПОСЛЕ выделения.
-      // Старый код превращал 3 выделенные строки в диапазон 0..2,
-      // но потом восстанавливал selection до строки 2, ch 0 — то есть уже
-      // только 2 строки. Дальше оно закономерно сжималось до одной.
-      const toIsExclusiveLineStart = selTo.ch === 0 && endLine > startLine;
-      if (toIsExclusiveLineStart) endLine -= 1;
-
-      restoreSelection = {
-        fromCh: selFrom.ch,
-        toCh: selTo.ch,
-        lineCount: endLine - startLine + 1,
-        toIsExclusiveLineStart
-      };
-    } else {
-      const cursor = editor.getCursor();
-      const range = this.computeVisibleMoveRangeAtLine(editor, cursor.line);
-      if (!range) { new Notice("Нечего перемещать"); return; }
-      startLine = range.startLine;
-      endLine   = range.endLine;
-    }
-
-    const neighbor = direction < 0
-      ? this.findPreviousVisibleMoveBlock(editor, startLine)
-      : this.findNextVisibleMoveBlock(editor, endLine);
-
-    if (!neighbor) {
-      new Notice(direction < 0 ? "Уже наверху" : "Уже внизу");
+      this.moveLineRange(editor, startLine, endLine, direction);
+      this.refreshStructurePanels(); this.refreshActiveToolbar();
       return;
     }
 
-    const targetLine = direction < 0 ? neighbor.startLine : neighbor.endLine + 1;
-    const newStartLine = this.moveBlock(editor, startLine, endLine, targetLine);
+    // 2) Нет выделения → старая логика: перенос всей ветки относительно соседа того же уровня.
+    const root = this.getCurrentHeading(editor); if (!root) return;
 
-    if (restoreSelection && newStartLine !== null && typeof editor.setSelection === "function") {
-      const totalAfter = editor.lineCount();
-      let toLine, toCh;
+    const headings = this.getHeadings(editor);
+    const cur = this.getBranch(editor, root);
 
-      if (restoreSelection.toIsExclusiveLineStart) {
-        // Для построчного выделения конец должен оставаться на строке ПОСЛЕ
-        // выделенного блока, иначе каждое перемещение будет съедать одну строку.
-        toLine = newStartLine + restoreSelection.lineCount;
-        toCh = 0;
-      } else {
-        toLine = newStartLine + restoreSelection.lineCount - 1;
-        toCh = restoreSelection.toCh;
+    let sibling = null;
+    if (direction < 0) {
+      for (let i = headings.length - 1; i >= 0; i--) {
+        const h = headings[i];
+        if (h.line >= root.line) continue;
+        if (h.level < root.level) break;
+        if (h.level === root.level) { sibling = h; break; }
       }
-
-      toLine = clamp(toLine, 0, Math.max(0, totalAfter - 1));
-      editor.setSelection(
-        { line: newStartLine, ch: restoreSelection.fromCh },
-        { line: toLine, ch: toCh }
-      );
+      if (!sibling) { new Notice("Нет предыдущей ветки того же уровня"); return; }
+      const sb = this.getBranch(editor, sibling);
+      this.moveBlock(editor, cur.startLine, cur.endLine, sb.startLine);
+      this.refreshStructurePanels(); this.refreshActiveToolbar();
+      new Notice("Ветка перемещена выше");
+      return;
     }
 
+    for (let j = 0; j < headings.length; j++) {
+      const h = headings[j];
+      if (h.line <= root.line) continue;
+      if (h.line <= cur.endLine) continue;
+      if (h.level < root.level) break;
+      if (h.level === root.level) { sibling = h; break; }
+    }
+    if (!sibling) { new Notice("Нет следующей ветки того же уровня"); return; }
+    const nb = this.getBranch(editor, sibling);
+    this.moveBlock(editor, cur.startLine, cur.endLine, nb.endLine + 1);
     this.refreshStructurePanels(); this.refreshActiveToolbar();
-    new Notice(direction < 0 ? "Перемещено выше" : "Перемещено ниже");
-  }
-
-  /** Совместимость со старым именем. */
-  computeBranchRangeAtLine(editor, line) {
-    return this.computeVisibleMoveRangeAtLine(editor, line);
+    new Notice("Ветка перемещена ниже");
   }
 
   /**
-   * Диапазон перемещения от строки.
-   * Если строка свёрнута — переносим весь скрытый блок.
-   * Если строка не свёрнута — переносим только саму строку.
+   * Перемещает диапазон строк [startLine..endLine] на одну строку
+   * выше/ниже (direction = -1 / +1). Если в диапазоне есть заголовок и
+   * следующая строка тоже заголовок того же уровня — диапазон перепрыгивает
+   * целую соседнюю ветку (соседи переставляются как блоки).
    */
-  computeVisibleMoveRangeAtLine(editor, line) {
+  moveLineRange(editor, startLine, endLine, direction) {
     const total = editor.lineCount();
-    if (line < 0 || line >= total) return null;
+    if (startLine < 0 || endLine >= total || startLine > endLine) return;
 
-    const folded = this.getFoldedLineRangeStartingAt(editor, line);
-    if (folded) return { startLine: folded.startLine, endLine: folded.endLine };
-
-    return { startLine: line, endLine: line };
-  }
-
-  /** Старое имя оставлено, чтобы не ломать возможные внутренние вызовы. */
-  computeWordMoveBlockAtLine(editor, line) {
-    return this.computeVisibleMoveRangeAtLine(editor, line);
-  }
-
-  /**
-   * Предыдущий видимый блок:
-   *   - обычная строка → одна строка;
-   *   - если попали в скрытую часть свёрнутого блока → весь свёрнутый блок;
-   *   - если предыдущая видимая строка сама свёрнута → весь свёрнутый блок.
-   */
-  findPreviousVisibleMoveBlock(editor, startLine) {
-    if (startLine <= 0) return null;
-    let line = startLine - 1;
-
-    const containing = this.getFoldedLineRangeContaining(editor, line);
-    if (containing) return containing;
-
-    const starting = this.getFoldedLineRangeStartingAt(editor, line);
-    if (starting) return starting;
-
-    return { startLine: line, endLine: line };
-  }
-
-  /**
-   * Следующий видимый блок:
-   *   - обычная строка → одна строка;
-   *   - если следующая видимая строка свёрнута → весь свёрнутый блок;
-   *   - если каким-то образом попали внутрь скрытой части → весь соответствующий блок.
-   */
-  findNextVisibleMoveBlock(editor, endLine) {
-    const total = editor.lineCount();
-    if (endLine >= total - 1) return null;
-    let line = endLine + 1;
-
-    const containing = this.getFoldedLineRangeContaining(editor, line);
-    if (containing) return containing;
-
-    const starting = this.getFoldedLineRangeStartingAt(editor, line);
-    if (starting) return starting;
-
-    return { startLine: line, endLine: line };
-  }
-
-  /** Старые имена оставлены как алиасы. */
-  findNextWordMoveBlock(editor, endLine) {
-    return this.findNextVisibleMoveBlock(editor, endLine);
-  }
-
-  findPreviousWordMoveBlock(editor, startLine) {
-    return this.findPreviousVisibleMoveBlock(editor, startLine);
-  }
-
-  getWordOutlineLevel(editor, line) {
-    const h = this.headingAtLine(editor, line);
-    if (h) return h.level;
-
-    const raw = editor.getLine(line);
-    if (raw == null || !raw.trim()) return null;
-
-    const indent = indentWidth((raw.match(/^\s*/) || [""])[0]);
-    return 7 + Math.floor(indent / 2);
-  }
-
-  headingAtLine(editor, line) {
-    const raw = editor.getLine(line) || "";
-    if (!/^#{1,6}\s+/.test(raw)) return null;
-    return this.getHeadings(editor).find((h) => h.line === line) || null;
-  }
-
-  nextNonEmptyLine(editor, fromLine) {
-    for (let i = fromLine; i < editor.lineCount(); i++) {
-      if ((editor.getLine(i) || "").trim()) return i;
-    }
-    return -1;
-  }
-
-  /**
-   * Все свёрнутые диапазоны CodeMirror/Obsidian как диапазоны строк.
-   * Fold обычно начинается на строке-заголовке/родителе и заканчивается
-   * на последней скрытой строке блока.
-   */
-  getFoldedLineRanges(editor) {
-    if (!this.cmLanguage || !editor || !editor.cm || !this.cmLanguage.foldedRanges) return [];
-    if (typeof editor.offsetToPos !== "function" || typeof editor.posToOffset !== "function") return [];
-
-    const total = editor.lineCount();
-    if (total <= 0) return [];
-
-    let from = null, to = null;
-    try {
-      from = editor.posToOffset({ line: 0, ch: 0 });
-      const lastLine = total - 1;
-      to = editor.posToOffset({ line: lastLine, ch: editor.getLine(lastLine).length });
-    } catch (e) { return []; }
-    if (from === null || to === null) return [];
-
-    const ranges = [];
-    try {
-      this.cmLanguage.foldedRanges(editor.cm.state).between(from, to, (a, b) => {
-        try {
-          const p1 = editor.offsetToPos(a);
-          const p2 = editor.offsetToPos(b);
-          if (!p1 || !p2) return;
-          const startLine = p1.line;
-          const endLine = Math.max(p1.line, p2.line);
-          if (endLine > startLine) ranges.push({ startLine, endLine });
-        } catch (e) { /* noop */ }
-      });
-    } catch (e) { return []; }
-
-    ranges.sort((x, y) => x.startLine - y.startLine || x.endLine - y.endLine);
-    return ranges;
-  }
-
-  getFoldedLineRangeStartingAt(editor, line) {
-    const ranges = this.getFoldedLineRanges(editor);
-    for (let i = 0; i < ranges.length; i++) {
-      if (ranges[i].startLine === line) return ranges[i];
-    }
-    return null;
-  }
-
-  getFoldedLineRangeContaining(editor, line) {
-    const ranges = this.getFoldedLineRanges(editor);
-    for (let i = 0; i < ranges.length; i++) {
-      const r = ranges[i];
-      if (line > r.startLine && line <= r.endLine) return r;
-    }
-    return null;
-  }
-
-  /**
-   * Пересчитать номер строки после перемещения блока [startLine..endLine]
-   * в позицию targetLine исходного документа.
-   */
-  mapLineAfterMove(line, startLine, endLine, targetLine, insertAt) {
-    const size = endLine - startLine + 1;
-
-    // Линия была внутри переносимого блока.
-    if (line >= startLine && line <= endLine) {
-      return insertAt + (line - startLine);
-    }
-
-    // Блок ушёл вниз: промежуточные строки поднялись на размер блока.
-    if (targetLine > endLine) {
-      if (line > endLine && line < targetLine) return line - size;
-      return line;
-    }
-
-    // Блок ушёл вверх: промежуточные строки опустились на размер блока.
-    if (targetLine < startLine) {
-      if (line >= targetLine && line < startLine) return line + size;
-      return line;
-    }
-
-    return line;
-  }
-
-  /**
-   * Восстановить fold-диапазоны после полной замены текста.
-   * Без этого CodeMirror теряет свёртку, и повторное нажатие начинает
-   * двигать уже одну строку вместо всей свёрнутой ветки.
-   */
-  restoreFoldedLineRanges(editor, ranges) {
-    if (!ranges || !ranges.length) return false;
-    if (!this.cmLanguage || !editor || !editor.cm || !this.cmLanguage.foldEffect) return false;
-    if (typeof editor.posToOffset !== "function") return false;
-
-    const effects = [];
-    const total = editor.lineCount();
-
-    for (let i = 0; i < ranges.length; i++) {
-      const r = ranges[i];
-      const startLine = clamp(r.startLine, 0, total - 1);
-      const endLine = clamp(r.endLine, 0, total - 1);
-      if (endLine <= startLine) continue;
-
-      try {
-        const from = editor.posToOffset({ line: startLine, ch: editor.getLine(startLine).length });
-        const to = editor.posToOffset({ line: endLine, ch: editor.getLine(endLine).length });
-        if (from !== null && to !== null && to > from) {
-          effects.push(this.cmLanguage.foldEffect.of({ from, to }));
-        }
-      } catch (e) { /* noop */ }
-    }
-
-    if (!effects.length) return false;
-
-    try {
-      editor.cm.dispatch({ effects });
-      return true;
-    } catch (e) {
-      console.error(e);
-      return false;
+    if (direction < 0) {
+      if (startLine === 0) { new Notice("Уже наверху"); return; }
+      // Если строка startLine — заголовок и строка startLine-1 (или сосед) тоже заголовок —
+      // перепрыгиваем соседнюю ветку. Иначе двигаем на одну строку.
+      const targetLine = this.findMoveTargetUp(editor, startLine);
+      this.moveBlock(editor, startLine, endLine, targetLine, { preserveSelection: true });
+      new Notice("Перемещено выше");
+    } else {
+      if (endLine >= total - 1) { new Notice("Уже внизу"); return; }
+      const targetLine = this.findMoveTargetDown(editor, endLine);
+      this.moveBlock(editor, startLine, endLine, targetLine, { preserveSelection: true });
+      new Notice("Перемещено ниже");
     }
   }
 
-  /**
-   * Повторное восстановление fold-state после того, как Obsidian/CodeMirror
-   * закончат обработку курсора и scrollIntoView. Без этого курсор на строке
-   * свёрнутого родителя иногда провоцирует авто-разворачивание уже после нашей
-   * первой попытки восстановить fold. Да, редактор тоже умеет жить своей жизнью.
-   */
-  scheduleRestoreFoldedLineRanges(editor, ranges) {
-    if (!ranges || !ranges.length) return;
-    const copy = ranges.map((r) => ({ startLine: r.startLine, endLine: r.endLine }));
-    const restore = () => {
-      try { this.restoreFoldedLineRanges(editor, copy); }
-      catch (e) { /* noop */ }
-    };
-    setTimeout(restore, 0);
-    setTimeout(restore, 30);
+  findMoveTargetUp(editor, startLine) {
+    const text = editor.getLine(startLine);
+    const m = text.match(/^(#{1,6})(\s+.+)$/);
+    if (m) {
+      // Это заголовок — ищем заголовок того же уровня выше и его branch.startLine.
+      const headings = this.getHeadings(editor);
+      const myLv = m[1].length;
+      let prev = null;
+      for (let i = headings.length - 1; i >= 0; i--) {
+        const h = headings[i];
+        if (h.line >= startLine) continue;
+        if (h.level < myLv) break;
+        if (h.level === myLv) { prev = h; break; }
+      }
+      if (prev) {
+        const pb = this.getBranch(editor, prev);
+        return pb.startLine;
+      }
+    }
+    // обычный текст — на одну строку выше
+    return startLine - 1;
+  }
+
+  findMoveTargetDown(editor, endLine) {
+    // Если последняя строка диапазона — заголовок, то целевая = конец следующей ветки + 1.
+    // Иначе — endLine + 2 (сдвиг на одну строку вниз).
+    const text = editor.getLine(endLine);
+    const m = text.match(/^(#{1,6})(\s+.+)$/);
+    if (m) {
+      const headings = this.getHeadings(editor);
+      const myLv = m[1].length;
+      let next = null;
+      for (let j = 0; j < headings.length; j++) {
+        const h = headings[j];
+        if (h.line <= endLine) continue;
+        if (h.level < myLv) break;
+        if (h.level === myLv) { next = h; break; }
+      }
+      if (next) {
+        const nb = this.getBranch(editor, next);
+        return nb.endLine + 1;
+      }
+    }
+    return endLine + 2;
   }
 
   /**
    * Атомарное перемещение [startLine..endLine] так, чтобы НОВАЯ позиция
    * первой строки блока оказалась на месте targetLine исходного документа.
+   *
+   * Важные детали, которые уже однажды ломались, конечно же:
+   *   - выделение после перемещения сохраняется на всём перенесённом блоке;
+   *   - если внутри переносимого блока были свёрнутые заголовки, они остаются свёрнутыми;
+   *   - один Ctrl+Z откатывает всю замену.
    */
-  moveBlock(editor, startLine, endLine, targetLine) {
+  moveBlock(editor, startLine, endLine, targetLine, options) {
+    options = options || {};
     const total = editor.lineCount();
     if (startLine < 0 || endLine >= total || startLine > endLine) return null;
     if (targetLine < 0) targetLine = 0;
     if (targetLine > total) targetLine = total;
-    if (targetLine >= startLine && targetLine <= endLine + 1) return startLine;
+    if (targetLine >= startLine && targetLine <= endLine + 1) return null; // нет смещения
 
-    // Снимок всех текущих fold-диапазонов до replaceRange. Полная замена текста
-    // сбрасывает fold state, поэтому его надо перенести на новые номера строк.
-    const foldedBefore = this.getFoldedLineRanges(editor);
+    const blockLen = endLine - startLine + 1;
+    const foldedRelativeLines = this.captureFoldedHeadingRelativeLines(editor, startLine, endLine);
 
+    // Соберём «строки» как массив, без склейки концов файла.
     const allLines = [];
     for (let i = 0; i < total; i++) allLines.push(editor.getLine(i));
 
     const block = allLines.slice(startLine, endLine + 1);
-    const removed = allLines.slice(0, startLine).concat(allLines.slice(endLine + 1));
+    const before = allLines.slice(0, startLine);
+    const after  = allLines.slice(endLine + 1);
 
+    const removed = before.concat(after);
+
+    // targetLine задавался относительно исходного документа.
+    // Если target идёт ПОСЛЕ удалённого блока, его индекс в removed уменьшается
+    // на размер блока.
     let insertAt = targetLine;
-    if (targetLine > endLine) insertAt = targetLine - (endLine - startLine + 1);
+    if (targetLine > endLine) insertAt = targetLine - blockLen;
     insertAt = clamp(insertAt, 0, removed.length);
-
-    const foldedAfter = foldedBefore.map((r) => {
-      return {
-        startLine: this.mapLineAfterMove(r.startLine, startLine, endLine, targetLine, insertAt),
-        endLine: this.mapLineAfterMove(r.endLine, startLine, endLine, targetLine, insertAt)
-      };
-    }).filter((r) => r.endLine > r.startLine);
 
     const finalLines = removed.slice(0, insertAt).concat(block).concat(removed.slice(insertAt));
 
+    // Полная замена содержимого даёт стабильную транзакцию и не плодит пустые строки.
     const lastLine = total - 1;
-    const lastCh = editor.getLine(lastLine).length;
-    editor.replaceRange(finalLines.join("\n"), { line: 0, ch: 0 }, { line: lastLine, ch: lastCh });
+    const lastCh   = editor.getLine(lastLine).length;
+    const newText = finalLines.join("\n");
+    editor.replaceRange(newText, { line: 0, ch: 0 }, { line: lastLine, ch: lastCh });
 
-    const cursorLine = clamp(insertAt, 0, finalLines.length - 1);
-    editor.setCursor({ line: cursorLine, ch: 0 });
+    const newStart = clamp(insertAt, 0, finalLines.length - 1);
+    const newEnd = clamp(insertAt + blockLen - 1, 0, finalLines.length - 1);
 
-    try {
-      editor.scrollIntoView({ from: { line: cursorLine, ch: 0 }, to: { line: cursorLine, ch: 0 } }, true);
-    } catch (e) { /* noop */ }
+    // Восстановить выделение именно как диапазон строк. Конец ставим в начало
+    // следующей строки, чтобы повторное Alt+Shift+↑/↓ не теряло последнюю строку.
+    if (options.preserveSelection) {
+      const from = { line: newStart, ch: 0 };
+      const to = (newEnd + 1 < finalLines.length)
+        ? { line: newEnd + 1, ch: 0 }
+        : { line: newEnd, ch: finalLines[newEnd].length };
+      try {
+        if (typeof editor.setSelection === "function") editor.setSelection(from, to);
+        else editor.setCursor(from);
+      } catch (e) { editor.setCursor(from); }
+      try { editor.scrollIntoView({ from, to }, true); } catch (e) { /* noop */ }
+    } else {
+      const cursorLine = newStart;
+      editor.setCursor({ line: cursorLine, ch: 0 });
+      try {
+        editor.scrollIntoView({ from: { line: cursorLine, ch: 0 }, to: { line: cursorLine, ch: 0 } }, true);
+      } catch (e) { /* noop */ }
+    }
 
-    // Восстанавливаем свёртку ПОСЛЕ установки курсора и прокрутки. И затем
-    // повторяем это отложенно, потому что Obsidian может асинхронно раскрыть
-    // fold под курсором уже после replaceRange/setCursor.
-    this.restoreFoldedLineRanges(editor, foldedAfter);
-    this.scheduleRestoreFoldedLineRanges(editor, foldedAfter);
+    this.restoreFoldedHeadingRelativeLines(editor, newStart, foldedRelativeLines);
+    return { startLine: newStart, endLine: newEnd };
+  }
 
-    return cursorLine;
+  captureFoldedHeadingRelativeLines(editor, startLine, endLine) {
+    const result = [];
+    if (!this.cmLanguage || !editor || !editor.cm || !this.cmLanguage.foldedRanges) return result;
+    const headings = this.getHeadings(editor).filter((h) => h.line >= startLine && h.line <= endLine);
+    if (!headings.length) return result;
+
+    const view = editor.cm;
+    for (const h of headings) {
+      const lineText = editor.getLine(h.line) || "";
+      const from = this.safePosToOffset(editor, { line: h.line, ch: lineText.length });
+      const branchEnd = this.getBranchEndLine(editor, h);
+      const to = this.safePosToOffset(editor, { line: branchEnd, ch: (editor.getLine(branchEnd) || "").length });
+      if (from === null || to === null || to <= from) continue;
+      try {
+        let isFolded = false;
+        this.cmLanguage.foldedRanges(view.state).between(from, to, (a, b) => {
+          if (Math.abs(a - from) <= 3 || (a >= from && a <= from + 3)) isFolded = true;
+        });
+        if (isFolded) result.push(h.line - startLine);
+      } catch (e) { /* ignore fold API quirks */ }
+    }
+    return result;
+  }
+
+  restoreFoldedHeadingRelativeLines(editor, newStartLine, relativeLines) {
+    if (!relativeLines || !relativeLines.length || !this.cmLanguage || !editor || !editor.cm) return;
+    const toFold = [];
+    for (const rel of relativeLines) {
+      const line = newStartLine + rel;
+      if (line < 0 || line >= editor.lineCount()) continue;
+      const text = editor.getLine(line) || "";
+      const m = text.match(/^(#{1,6})(\s+.+)$/);
+      if (!m) continue;
+      toFold.push({ line, level: m[1].length, text, title: text.replace(/^#{1,6}\s+/, "").trim() });
+    }
+    if (!toFold.length) return;
+    try { window.setTimeout(() => this.foldHeadingsDirect(editor, toFold), 0); }
+    catch (e) { /* noop */ }
   }
 
   // ─────────────────────── нормализация уровней ───────────────────────
@@ -1627,6 +1551,7 @@ module.exports = class StructureCommanderPlugin extends Plugin {
   // ─────────────────────── перенумерация ───────────────────────
 
   openRenumberModal(mode) {
+    if (this.isVaultTreeContext()) return this.openVaultRenumberModal(mode === "remove" ? "remove" : "renumber");
     const editor = this.getEditor(); if (!editor) return;
     new RenumberModal(this.app, this, editor, mode).open();
   }
@@ -1852,6 +1777,363 @@ module.exports = class StructureCommanderPlugin extends Plugin {
       console.error(e);
       new Notice("Откройте: Настройки → Hotkeys, и найдите команду Structure");
     }
+  }
+
+
+
+  // ─────────────────────── vault tree: файлы, папки, меню, undo/redo ───────────────────────
+
+  isVaultTreeContext() {
+    if (!this.settings.vaultOrderEnabled) return false;
+    try {
+      const ae = document.activeElement;
+      if (!ae || !ae.closest) return false;
+      return !!ae.closest('.workspace-leaf-content[data-type="file-explorer"], .nav-files-container, .nav-folder, .nav-file, .tree-item-self');
+    } catch (e) { return false; }
+  }
+
+  getVaultTarget(silent) {
+    let p = "";
+    try {
+      const ae = document.activeElement;
+      const node = ae && ae.closest ? ae.closest('[data-path]') : null;
+      if (node) p = node.getAttribute('data-path') || "";
+    } catch (e) {}
+    if (!p) p = this.lastVaultTargetPath || "";
+    if (!p) {
+      const cur = this.getCurrentMarkdownFile();
+      if (cur) p = cur.path;
+    }
+    const target = p ? this.app.vault.getAbstractFileByPath(p) : null;
+    if (!target && !silent) new Notice("Не выбран файл или папка в дереве vault");
+    return target;
+  }
+
+  getVaultFolderForAction(target) {
+    if (target instanceof TFolder) return target;
+    if (target instanceof TFile && target.parent) return target.parent;
+    return this.app.vault.getRoot ? this.app.vault.getRoot() : null;
+  }
+
+  buildVaultContextMenu(menu, file) {
+    if (!file) return;
+    menu.addSeparator();
+    menu.addItem((item) => {
+      item.setTitle("Файл").setIcon("file-cog");
+      const sub = typeof item.setSubmenu === "function" ? item.setSubmenu() : null;
+      const targetMenu = sub || menu;
+      targetMenu.addItem((it) => it.setTitle("Открыть в проводнике").setIcon("folder-open").onClick(() => this.openInExplorer(file)));
+      targetMenu.addItem((it) => it.setTitle("Скопировать путь").setIcon("copy").onClick(() => this.copyVaultPath(file)));
+      targetMenu.addItem((it) => it.setTitle("Скопировать файл в буфер").setIcon("clipboard-copy").onClick(() => this.copyFileToClipboard(file)));
+      targetMenu.addItem((it) => {
+        it.setTitle("Отправить").setIcon("send");
+        const sendSub = typeof it.setSubmenu === "function" ? it.setSubmenu() : null;
+        if (!sendSub) { it.onClick(() => this.openSendToFolder()); return; }
+        this.fillSendToMenu(sendSub, file);
+      });
+      targetMenu.addSeparator();
+      targetMenu.addItem((it) => it.setTitle("Режим отработки: " + (this.settings.vaultDryRun ? "вкл" : "выкл")).setIcon("test-tube").onClick(async () => {
+        this.settings.vaultDryRun = !this.settings.vaultDryRun;
+        await this.saveSettings();
+        new Notice("Режим отработки: " + (this.settings.vaultDryRun ? "включён" : "выключен"));
+      }));
+      targetMenu.addSeparator();
+      targetMenu.addItem((it) => it.setTitle("Ctrl+Z — отменить файловую операцию").setIcon("undo-2").onClick(() => this.undoVaultOperation()).setDisabled(!this.vaultUndoStack.length));
+      targetMenu.addItem((it) => it.setTitle("Ctrl+Y — повторить файловую операцию").setIcon("redo-2").onClick(() => this.redoVaultOperation()).setDisabled(!this.vaultRedoStack.length));
+    });
+
+    menu.addSeparator();
+    menu.addItem((it) => it.setTitle("Structure: перенумеровать папку…").setIcon("list-ordered").onClick(() => { this.lastVaultTargetPath = file.path; this.openVaultRenumberModal("renumber"); }));
+    menu.addItem((it) => it.setTitle("Structure: удалить нумерацию…").setIcon("eraser").onClick(() => { this.lastVaultTargetPath = file.path; this.openVaultRenumberModal("remove"); }));
+    menu.addItem((it) => it.setTitle(this.labelWithHotkey("Файл/папка выше", "move-current-branch-up")).setIcon("arrow-up").onClick(() => { this.lastVaultTargetPath = file.path; this.moveVaultItem(-1); }));
+    menu.addItem((it) => it.setTitle(this.labelWithHotkey("Файл/папка ниже", "move-current-branch-down")).setIcon("arrow-down").onClick(() => { this.lastVaultTargetPath = file.path; this.moveVaultItem(1); }));
+    menu.addItem((it) => it.setTitle(this.labelWithHotkey("На уровень выше", "promote-current-branch")).setIcon("arrow-left").onClick(() => { this.lastVaultTargetPath = file.path; this.moveVaultItemOut(); }));
+    menu.addItem((it) => it.setTitle(this.labelWithHotkey("Внутрь предыдущей папки", "demote-current-branch")).setIcon("arrow-right").onClick(() => { this.lastVaultTargetPath = file.path; this.moveVaultItemIntoPreviousFolder(); }));
+  }
+
+  handleVaultUndoRedoKeydown(evt) {
+    if (!this.isVaultTreeContext()) return;
+    const key = String(evt.key || "").toLowerCase();
+    if ((evt.ctrlKey || evt.metaKey) && !evt.shiftKey && key === "z") {
+      evt.preventDefault(); evt.stopPropagation(); this.undoVaultOperation();
+    } else if ((evt.ctrlKey || evt.metaKey) && !evt.shiftKey && key === "y") {
+      evt.preventDefault(); evt.stopPropagation(); this.redoVaultOperation();
+    }
+  }
+
+  fullVaultPath(file) {
+    try { return this.app.vault.adapter.getFullPath(file.path); }
+    catch (e) { return file.path; }
+  }
+
+  openInExplorer(file) {
+    const full = this.fullVaultPath(file);
+    if (electronShell && typeof electronShell.showItemInFolder === "function") {
+      electronShell.showItemInFolder(full);
+      return;
+    }
+    new Notice("Открытие в проводнике доступно только в desktop Obsidian");
+  }
+
+  async copyVaultPath(file) {
+    const full = this.fullVaultPath(file);
+    try {
+      if (electronClipboard) electronClipboard.writeText(full);
+      else await navigator.clipboard.writeText(full);
+      new Notice("Путь скопирован");
+    } catch (e) { console.error(e); new Notice("Не удалось скопировать путь"); }
+  }
+
+  copyFileToClipboard(file) {
+    if (!childProcess || typeof process === "undefined" || process.platform !== "win32") {
+      new Notice("Копирование файла в буфер реализовано для Windows desktop");
+      return;
+    }
+    const full = this.fullVaultPath(file);
+    const ps = `Set-Clipboard -LiteralPath ${JSON.stringify(full)}`;
+    childProcess.execFile("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], { windowsHide: true }, (err) => {
+      if (err) { console.error(err); new Notice("Не удалось скопировать файл в буфер"); }
+      else new Notice("Файл скопирован в буфер");
+    });
+  }
+
+  sendToFolderPath() {
+    if (typeof process === "undefined" || process.platform !== "win32" || !process.env.APPDATA || !nodePath) return "";
+    return nodePath.join(process.env.APPDATA, "Microsoft", "Windows", "SendTo");
+  }
+
+  fillSendToMenu(menu, file) {
+    const folder = this.sendToFolderPath();
+    if (!folder || !nodeFs || !nodeFs.existsSync(folder)) {
+      menu.addItem((x) => x.setTitle("SendTo недоступен").setDisabled(true));
+      return;
+    }
+    let entries = [];
+    try { entries = nodeFs.readdirSync(folder).filter((x) => !x.startsWith(".")); } catch (e) { entries = []; }
+    if (!entries.length) { menu.addItem((x) => x.setTitle("Пункты не найдены").setDisabled(true)); return; }
+    entries.slice(0, 30).forEach((name) => {
+      const fullSendTo = nodePath.join(folder, name);
+      const label = name.replace(/\.(lnk|url|DeskLink|MAPIMail|mydocs)$/i, "");
+      menu.addItem((it) => it.setTitle(label).onClick(() => this.runSendToTarget(fullSendTo, file)));
+    });
+    menu.addSeparator();
+    menu.addItem((it) => it.setTitle("Открыть папку SendTo").setIcon("folder-open").onClick(() => this.openSendToFolder()));
+  }
+
+  openSendToFolder() {
+    const p = this.sendToFolderPath();
+    if (p && electronShell) electronShell.openPath(p);
+    else new Notice("Папка SendTo недоступна");
+  }
+
+  runSendToTarget(sendToPath, file) {
+    if (!childProcess || typeof process === "undefined" || process.platform !== "win32") { new Notice("SendTo доступен только в Windows desktop"); return; }
+    const fullFile = this.fullVaultPath(file);
+    const cmd = `Start-Process -FilePath ${JSON.stringify(sendToPath)} -ArgumentList @(${JSON.stringify(fullFile)})`;
+    childProcess.execFile("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", cmd], { windowsHide: true }, (err) => {
+      if (err) { console.error(err); new Notice("Не удалось выполнить SendTo"); }
+    });
+  }
+
+  pushVaultHistory(label, moves) {
+    if (!moves || !moves.length) return;
+    this.vaultUndoStack.push({ label, moves: moves.map((m) => ({ oldPath: m.oldPath, newPath: m.newPath })) });
+    if (this.vaultUndoStack.length > 50) this.vaultUndoStack.shift();
+    this.vaultRedoStack = [];
+  }
+
+  async undoVaultOperation() {
+    const op = this.vaultUndoStack.pop();
+    if (!op) { new Notice("Нет файловых операций для отмены"); return; }
+    const reverse = op.moves.slice().reverse().map((m) => ({ oldPath: m.newPath, newPath: m.oldPath }));
+    const ok = await this.applyVaultPathMoves(reverse, false, "Отмена: " + op.label);
+    if (ok) this.vaultRedoStack.push(op);
+  }
+
+  async redoVaultOperation() {
+    const op = this.vaultRedoStack.pop();
+    if (!op) { new Notice("Нет файловых операций для повтора"); return; }
+    const ok = await this.applyVaultPathMoves(op.moves, false, "Повтор: " + op.label);
+    if (ok) this.vaultUndoStack.push(op);
+  }
+
+  async applyVaultPathMoves(moves, pushHistory, label) {
+    const plan = [];
+    for (const m of moves) {
+      const f = this.app.vault.getAbstractFileByPath(m.oldPath);
+      if (!f) { new Notice("Не найдено: " + m.oldPath); return false; }
+      plan.push({ file: f, oldPath: m.oldPath, newPath: m.newPath, oldName: f.name, newName: m.newPath.split('/').pop() });
+    }
+    return await this.applyVaultRenamePlan(plan, { pushHistory, label: label || "Файловая операция" });
+  }
+
+  openVaultRenumberModal(action) {
+    const target = this.getVaultTarget(true);
+    const folder = this.getVaultFolderForAction(target);
+    if (!folder) { new Notice("Не удалось определить папку vault"); return; }
+    new VaultRenumberModal(this.app, this, folder, action || "renumber").open();
+  }
+
+  getVaultChildren(folder, options) {
+    const targets = (options && options.targets) || this.settings.vaultNumberingTargets || "both";
+    const order = (options && options.order) || this.settings.vaultNumberingOrder || "folders-first";
+    let arr = (folder.children || []).filter((x) => {
+      if (x instanceof TFolder) return targets === "folders" || targets === "both";
+      if (x instanceof TFile) return (targets === "notes" || targets === "both") && x.extension && x.extension.toLowerCase() === "md";
+      return false;
+    });
+    const byName = (a, b) => this.cleanVaultDisplayName(a).localeCompare(this.cleanVaultDisplayName(b), undefined, { numeric: true, sensitivity: "base" });
+    arr.sort((a, b) => {
+      if (order === "folders-first" && (a instanceof TFolder) !== (b instanceof TFolder)) return a instanceof TFolder ? -1 : 1;
+      if (order === "notes-first" && (a instanceof TFolder) !== (b instanceof TFolder)) return a instanceof TFile ? -1 : 1;
+      return byName(a, b);
+    });
+    return arr;
+  }
+
+  cleanVaultDisplayName(file) {
+    const parsed = splitVaultName(file);
+    return stripVaultNumberingPrefix(parsed.base);
+  }
+
+  collectVaultRenamePlan(folder, options) {
+    const action = options.action || "renumber";
+    const styleId = options.style || this.settings.vaultNumberingStyle || "decimal_2_underscore";
+    const items = this.getVaultChildren(folder, options);
+    const plan = [];
+    items.forEach((item, idx) => {
+      const parsed = splitVaultName(item);
+      const cleanBase = (options.stripOld !== false) ? stripVaultNumberingPrefix(parsed.base) : parsed.base;
+      const nextBase = action === "remove" ? cleanBase : makeVaultNumberedBase(cleanBase, idx + 1, styleId, options);
+      const nextName = nextBase + parsed.ext;
+      if (nextName !== item.name) {
+        const parentPath = item.parent && item.parent.path ? item.parent.path : "";
+        const newPath = normalizePath(parentPath ? parentPath + "/" + nextName : nextName);
+        plan.push({ file: item, oldPath: item.path, newPath, oldName: item.name, newName: nextName });
+      }
+    });
+    return plan;
+  }
+
+  validateVaultRenamePlan(plan) {
+    const targetSet = new Set();
+    const oldSet = new Set(plan.map((p) => p.oldPath));
+    for (const p of plan) {
+      if (targetSet.has(p.newPath)) return "Два элемента получают один путь: " + p.newPath;
+      targetSet.add(p.newPath);
+      const exists = this.app.vault.getAbstractFileByPath(p.newPath);
+      if (exists && !oldSet.has(p.newPath)) return "Уже существует: " + p.newPath;
+    }
+    return "";
+  }
+
+  async applyVaultRenamePlan(plan, options) {
+    options = options || {};
+    const err = this.validateVaultRenamePlan(plan);
+    if (err) { new Notice(err); return false; }
+    if (!plan.length) { new Notice("Нечего менять"); return true; }
+    if (this.settings.vaultDryRun) {
+      console.log("Structure Commander dry-run", plan.map((p) => [p.oldPath, p.newPath]));
+      new Notice("Режим отработки: план выведен в консоль, файлы не изменены");
+      return false;
+    }
+    const tmpPlan = [];
+    for (let i = 0; i < plan.length; i++) {
+      const p = plan[i];
+      const parentPath = p.file.parent && p.file.parent.path ? p.file.parent.path : "";
+      const tmpName = "__sc_tmp_" + Date.now() + "_" + i + "__" + p.file.name;
+      const tmpPath = normalizePath(parentPath ? parentPath + "/" + tmpName : tmpName);
+      tmpPlan.push(Object.assign({}, p, { tmpPath }));
+    }
+    try {
+      for (const p of tmpPlan) await this.renameVaultFile(p.file, p.tmpPath);
+      for (const p of tmpPlan) {
+        const tmpFile = this.app.vault.getAbstractFileByPath(p.tmpPath);
+        if (!tmpFile) throw new Error("Временный путь не найден: " + p.tmpPath);
+        await this.renameVaultFile(tmpFile, p.newPath);
+      }
+      if (options.pushHistory !== false) this.pushVaultHistory(options.label || "Файловая операция", plan);
+      new Notice((options.label || "Переименовано") + ": " + plan.length);
+      return true;
+    } catch (e) { console.error(e); new Notice("Ошибка файловой операции. Проверьте vault вручную"); return false; }
+  }
+
+  async renameVaultFile(file, newPath) {
+    if (this.app.fileManager && typeof this.app.fileManager.renameFile === "function") return await this.app.fileManager.renameFile(file, newPath);
+    return await this.app.vault.rename(file, newPath);
+  }
+
+  async moveVaultItem(direction) {
+    const target = this.getVaultTarget(); if (!target) return;
+    const folder = target.parent; if (!folder) { new Notice("Элемент уже в корне или недоступен"); return; }
+    const styleId = this.detectVaultOrderStyle(target.name) || this.settings.vaultNumberingStyle || "decimal_2_underscore";
+    const style = VAULT_NUMBERING_STYLES.find((x) => x.id === styleId);
+    if (!style || !style.orderable) { new Notice("Для этого стиля нельзя менять порядок вверх/вниз"); return; }
+    const items = this.getVaultChildren(folder, { targets: "both", order: this.settings.vaultNumberingOrder || "folders-first" });
+    const idx = items.findIndex((x) => x.path === target.path);
+    const swapIdx = idx + (direction < 0 ? -1 : 1);
+    if (idx < 0 || swapIdx < 0 || swapIdx >= items.length) { new Notice(direction < 0 ? "Уже наверху" : "Уже внизу"); return; }
+    const reordered = items.slice();
+    const tmp = reordered[idx]; reordered[idx] = reordered[swapIdx]; reordered[swapIdx] = tmp;
+    const plan = [];
+    reordered.forEach((item, i) => {
+      const parsed = splitVaultName(item);
+      const cleanBase = stripVaultNumberingPrefix(parsed.base);
+      const nextBase = makeVaultNumberedBase(cleanBase, i + 1, styleId, this.settings);
+      const nextName = nextBase + parsed.ext;
+      if (nextName !== item.name) {
+        const parentPath = item.parent && item.parent.path ? item.parent.path : "";
+        plan.push({ file: item, oldPath: item.path, newPath: normalizePath(parentPath ? parentPath + "/" + nextName : nextName), oldName: item.name, newName: nextName });
+      }
+    });
+    await this.applyVaultRenamePlan(plan, { label: direction < 0 ? "Файл/папка выше" : "Файл/папка ниже" });
+  }
+
+  async moveVaultItemOut() {
+    const target = this.getVaultTarget(); if (!target) return;
+    const parent = target.parent;
+    if (!parent || !parent.parent) { new Notice("Уже в корне vault"); return; }
+    const newPath = normalizePath((parent.parent.path ? parent.parent.path + "/" : "") + target.name);
+    if (this.app.vault.getAbstractFileByPath(newPath)) { new Notice("Уже существует: " + newPath); return; }
+    await this.applyVaultRenamePlan([{ file: target, oldPath: target.path, newPath, oldName: target.name, newName: target.name }], { label: "На уровень выше" });
+  }
+
+  async moveVaultItemIntoPreviousFolder() {
+    const target = this.getVaultTarget(); if (!target) return;
+    const parent = target.parent; if (!parent) { new Notice("Нет родительской папки"); return; }
+    const siblings = (parent.children || []).slice().sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
+    const idx = siblings.findIndex((x) => x.path === target.path);
+    let prevFolder = null;
+    for (let i = idx - 1; i >= 0; i--) if (siblings[i] instanceof TFolder) { prevFolder = siblings[i]; break; }
+    if (!prevFolder) { new Notice("Нет предыдущей папки-соседа"); return; }
+    if (target instanceof TFolder && (prevFolder.path === target.path || prevFolder.path.startsWith(target.path + "/"))) { new Notice("Нельзя переместить папку внутрь самой себя"); return; }
+    const newPath = normalizePath(prevFolder.path + "/" + target.name);
+    if (this.app.vault.getAbstractFileByPath(newPath)) { new Notice("Уже существует: " + newPath); return; }
+    await this.applyVaultRenamePlan([{ file: target, oldPath: target.path, newPath, oldName: target.name, newName: target.name }], { label: "Внутрь предыдущей папки" });
+  }
+
+  detectVaultOrderStyle(name) {
+    const base = splitVaultName({ name }).base;
+    if (/^\d{3}_/.test(base)) return "decimal_3_underscore";
+    if (/^\d{2}_/.test(base)) return "decimal_2_underscore";
+    if (/^[A-Z]_/.test(base)) return "latin_upper_underscore";
+    if (/^[a-z]_/.test(base)) return "latin_lower_underscore";
+    if (/^[А-Я]_/.test(base)) return "cyrillic_upper_underscore";
+    if (/^[а-я]_/.test(base)) return "cyrillic_lower_underscore";
+    if (/^(?:M|CM|D|CD|C|XC|L|XL|X|IX|V|IV|I)+_/.test(base)) return "roman_upper_underscore";
+    if (/^(?:m|cm|d|cd|c|xc|l|xl|x|ix|v|iv|i)+_/.test(base)) return "roman_lower_underscore";
+    return "";
+  }
+
+  toggleVaultFolder(expand) {
+    const target = this.getVaultTarget(true);
+    if (!(target instanceof TFolder)) { new Notice("Выберите папку в дереве vault"); return; }
+    try {
+      const selector = '[data-path="' + target.path.replace(/"/g, '\\"') + '"]';
+      const el = document.querySelector(selector);
+      const trigger = el && (el.querySelector('.tree-item-icon, .nav-folder-collapse-indicator') || el);
+      if (trigger) trigger.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    } catch (e) { console.error(e); }
   }
 
   // ─────────────────────── toolbar над редактором ───────────────────────
@@ -2319,18 +2601,18 @@ class EditorToolbar {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// StructurePanelView — компактная боковая панель структуры.
-// Сделана ближе к встроенной Outline-панели Obsidian: только дерево заголовков,
-// без отдельного пульта, поиска, счётчиков и кнопочного зоопарка.
+// StructurePanelView — боковая панель с поиском и фильтром.
+// Уровень заголовка передаётся ВИЗУАЛЬНО (отступ + жирность + цвет),
+// без подписей "H1/H2/...".
 // ═══════════════════════════════════════════════════════════════════════════════
 class StructurePanelView extends ItemView {
   constructor(leaf, plugin) {
     super(leaf);
     this.plugin = plugin;
     this.maxLevel = plugin.settings.panelMaxLevel || 6;
+    this.search = "";
     this._readToken = 0;
-    this.panelCollapsed = new Set(); // локальная свёртка только внутри панели, редактор не трогаем
-    this.scheduleRender = debounce(() => this.render(), 180, true);
+    this.scheduleRender = debounce(() => this.render(), 220, true);
   }
 
   getViewType() { return STRUCTURE_PANEL_VIEW; }
@@ -2339,13 +2621,9 @@ class StructurePanelView extends ItemView {
 
   async onOpen() {
     this.render();
+    // Подсветка активной ветки при движении курсора
     this.registerEvent(this.app.workspace.on("editor-change", () => this.scheduleRender()));
     this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.scheduleRender()));
-    this.registerEvent(this.app.workspace.on("file-open", () => this.scheduleRender()));
-    this.registerEvent(this.app.vault.on("modify", (file) => {
-      const cur = this.plugin.getCurrentMarkdownFile();
-      if (cur && file && file.path === cur.path) this.scheduleRender();
-    }));
   }
 
   render() {
@@ -2353,22 +2631,66 @@ class StructurePanelView extends ItemView {
     container.empty();
     container.addClass("structure-panel-root");
 
-    // Локальные стили держим здесь, чтобы main.js можно было заменить одним файлом
-    // без обязательного обновления styles.css. Да, CSS внутри JS выглядит как ремонт
-    // изолентой, зато не ломает установку.
-    this.ensureInlineStyles(container);
-
     const file = this.plugin.getCurrentMarkdownFile();
-    const body = container.createDiv({ cls: "scmd-outline" });
+
+    // ── header ──
+    const header = container.createDiv({ cls: "structure-panel-header" });
+    header.createDiv({ cls: "structure-panel-title", text: "Структура" });
+
+    const select = header.createEl("select", { cls: "structure-panel-level-select" });
+    [
+      ["1", "До H1"],
+      ["2", "До H2"],
+      ["3", "До H3"],
+      ["4", "До H4"],
+      ["5", "До H5"],
+      ["6", "До H6"],
+      ["all", "Все"]
+    ].forEach((p) => {
+      const o = select.createEl("option");
+      o.value = p[0]; o.text = p[1];
+      if (
+        (p[0] === "all" && this.maxLevel >= 6) ||
+        (p[0] !== "all" && Number(p[0]) === this.maxLevel)
+      ) o.selected = true;
+    });
+    select.addEventListener("change", async () => {
+      this.maxLevel = (select.value === "all") ? 6 : Number(select.value);
+      this.plugin.settings.panelMaxLevel = this.maxLevel;
+      await this.plugin.saveSettings();
+      this.render();
+    });
+
+    const refresh = header.createEl("button", { cls: "structure-panel-icon-btn", text: "↻" });
+    refresh.title = "Обновить";
+    refresh.addEventListener("click", () => this.render());
+
+    const closeBtn = header.createEl("button", { cls: "structure-panel-icon-btn", text: "×" });
+    closeBtn.title = "Скрыть панель";
+    closeBtn.addEventListener("click", () => this.plugin.closeStructurePanel());
+
+    // ── search ──
+    const searchRow = container.createDiv({ cls: "structure-panel-searchrow" });
+    const searchInput = searchRow.createEl("input", { type: "text", cls: "structure-panel-search" });
+    searchInput.placeholder = "Поиск по заголовкам";
+    searchInput.value = this.search;
+    searchInput.addEventListener("input", () => {
+      this.search = searchInput.value || "";
+      this.renderList();
+    });
 
     if (!file) {
-      body.createDiv({ cls: "scmd-outline-empty", text: "Откройте Markdown-заметку" });
+      container.createDiv({ cls: "structure-panel-empty", text: "Откройте Markdown-заметку" });
       return;
     }
+
+    const body = container.createDiv({ cls: "structure-panel-body" });
+    body.createDiv({ cls: "structure-panel-file", text: file.name });
 
     this.bodyEl = body;
     this.fileForRender = file;
 
+    // Защита от race condition — увеличиваем токен и ждём только свой результат.
     const myToken = ++this._readToken;
     this.app.vault.cachedRead(file).then((text) => {
       if (myToken !== this._readToken) return;
@@ -2377,105 +2699,34 @@ class StructurePanelView extends ItemView {
     });
   }
 
-  ensureInlineStyles(container) {
-    if (container.querySelector("style[data-scmd-outline-style]")) return;
-    const style = container.createEl("style");
-    style.setAttribute("data-scmd-outline-style", "true");
-    style.textContent = `
-      .structure-panel-root {
-        padding: 0;
-        overflow: hidden;
-      }
-      .structure-panel-root .scmd-outline {
-        height: 100%;
-        overflow: auto;
-        padding: 4px 0 8px 0;
-        font-size: var(--font-ui-small);
-        color: var(--text-normal);
-      }
-      .structure-panel-root .scmd-outline-empty {
-        color: var(--text-muted);
-        padding: 8px 12px;
-      }
-      .structure-panel-root .scmd-outline-list {
-        position: relative;
-        padding: 2px 0;
-      }
-      .structure-panel-root .scmd-outline-item {
-        position: relative;
-        display: flex;
-        align-items: center;
-        gap: 4px;
-        min-height: 22px;
-        line-height: 22px;
-        padding: 0 8px 0 6px;
-        border-radius: var(--radius-s);
-        cursor: pointer;
-        user-select: none;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
-      .structure-panel-root .scmd-outline-item:hover {
-        background: var(--background-modifier-hover);
-      }
-      .structure-panel-root .scmd-outline-item-active {
-        background: var(--background-modifier-hover);
-        color: var(--text-accent);
-      }
-      .structure-panel-root .scmd-outline-toggle {
-        width: 12px;
-        min-width: 12px;
-        color: var(--text-faint);
-        font-size: 11px;
-        text-align: center;
-      }
-      .structure-panel-root .scmd-outline-title {
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
-      .structure-panel-root .scmd-outline-level-1 { padding-left: 4px;  font-weight: 500; }
-      .structure-panel-root .scmd-outline-level-2 { padding-left: 18px; }
-      .structure-panel-root .scmd-outline-level-3 { padding-left: 32px; }
-      .structure-panel-root .scmd-outline-level-4 { padding-left: 46px; }
-      .structure-panel-root .scmd-outline-level-5 { padding-left: 60px; }
-      .structure-panel-root .scmd-outline-level-6 { padding-left: 74px; }
-      .structure-panel-root .scmd-outline-level-2::before,
-      .structure-panel-root .scmd-outline-level-3::before,
-      .structure-panel-root .scmd-outline-level-4::before,
-      .structure-panel-root .scmd-outline-level-5::before,
-      .structure-panel-root .scmd-outline-level-6::before {
-        content: "";
-        position: absolute;
-        top: 0;
-        bottom: 0;
-        width: 1px;
-        background: var(--background-modifier-border);
-        opacity: 0.8;
-      }
-      .structure-panel-root .scmd-outline-level-2::before { left: 10px; }
-      .structure-panel-root .scmd-outline-level-3::before { left: 24px; }
-      .structure-panel-root .scmd-outline-level-4::before { left: 38px; }
-      .structure-panel-root .scmd-outline-level-5::before { left: 52px; }
-      .structure-panel-root .scmd-outline-level-6::before { left: 66px; }
-    `;
-  }
-
   renderList() {
     if (!this.bodyEl) return;
     const body = this.bodyEl;
     const file = this.fileForRender;
     if (!file || !this.allHeadings) return;
 
+    // Очищаем тело, оставляем строку файла
+    const fileLine = body.querySelector(".structure-panel-file");
     body.empty();
+    if (fileLine) body.appendChild(fileLine);
 
     const all = this.allHeadings;
+    let filtered = all.filter((h) => h.level <= this.maxLevel);
+    const q = this.search.trim().toLowerCase();
+    if (q) {
+      filtered = filtered.filter((h) => h.title.toLowerCase().includes(q));
+    }
 
-    if (!all.length) {
-      body.createDiv({ cls: "scmd-outline-empty", text: "Нет заголовков" });
+    // Счётчик
+    const counter = body.createDiv({ cls: "structure-panel-counter" });
+    counter.setText(filtered.length + " / " + all.length);
+
+    if (filtered.length === 0) {
+      body.createDiv({ cls: "structure-panel-empty", text: q ? "Ничего не найдено" : "Нет заголовков" });
       return;
     }
 
+    // Текущий заголовок (для подсветки)
     let activeLine = -1;
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
     if (view && view.file && view.file.path === file.path && view.editor) {
@@ -2483,41 +2734,13 @@ class StructurePanelView extends ItemView {
       if (cur) activeLine = cur.line;
     }
 
-    const list = body.createDiv({ cls: "scmd-outline-list" });
-    const hasChildren = new Set();
-    for (let i = 0; i < all.length - 1; i++) {
-      const h = all[i];
-      const n = all[i + 1];
-      if (n && n.level > h.level) hasChildren.add(h.line);
-    }
+    const list = body.createDiv({ cls: "structure-panel-list" });
 
-    const visible = this.getPanelVisibleHeadings(all, hasChildren);
-    if (!visible.length) {
-      body.createDiv({ cls: "scmd-outline-empty", text: "Нет заголовков" });
-      return;
-    }
-
-    visible.forEach((h) => {
-      const item = list.createDiv({
-        cls: "scmd-outline-item scmd-outline-level-" + h.level
-      });
-      if (h.line === activeLine) item.addClass("scmd-outline-item-active");
+    filtered.forEach((h) => {
+      const item = list.createDiv({ cls: "structure-panel-item structure-panel-level-" + h.level });
+      item.setText(h.title || "(без названия)");
+      if (h.line === activeLine) item.addClass("structure-panel-item-active");
       item.title = "Строка " + (h.line + 1);
-
-      const canCollapse = hasChildren.has(h.line);
-      const isCollapsed = this.isPanelCollapsed(h);
-      const toggle = item.createSpan({ cls: "scmd-outline-toggle" });
-      toggle.setText(canCollapse ? (isCollapsed ? "›" : "⌄") : "");
-      if (canCollapse) {
-        toggle.addEventListener("click", (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          this.togglePanelHeading(h);
-        });
-      }
-
-      item.createSpan({ cls: "scmd-outline-title", text: h.title || "(без названия)" });
-
       item.addEventListener("click", () => this.plugin.jumpToHeading(file, h.line));
       item.addEventListener("contextmenu", (e) => {
         e.preventDefault();
@@ -2526,63 +2749,20 @@ class StructurePanelView extends ItemView {
     });
   }
 
-  panelKey(heading) {
-    const file = this.fileForRender;
-    return (file ? file.path : "") + ":" + heading.line;
-  }
-
-  isPanelCollapsed(heading) {
-    return this.panelCollapsed.has(this.panelKey(heading));
-  }
-
-  togglePanelHeading(heading) {
-    const key = this.panelKey(heading);
-    if (this.panelCollapsed.has(key)) this.panelCollapsed.delete(key);
-    else this.panelCollapsed.add(key);
-    this.renderList();
-  }
-
-  setPanelHeadingCollapsed(heading, collapsed) {
-    const key = this.panelKey(heading);
-    if (collapsed) this.panelCollapsed.add(key);
-    else this.panelCollapsed.delete(key);
-    this.renderList();
-  }
-
-  getPanelVisibleHeadings(all, hasChildren) {
-    const visible = [];
-    const collapsedStack = [];
-
-    for (let i = 0; i < all.length; i++) {
-      const h = all[i];
-
-      while (collapsedStack.length && collapsedStack[collapsedStack.length - 1].level >= h.level) {
-        collapsedStack.pop();
-      }
-
-      const hiddenByPanel = collapsedStack.length > 0;
-      if (!hiddenByPanel && h.level <= this.maxLevel) visible.push(h);
-
-      // Сворачиваем только внутри панели: не вызываем collapseCurrentBranch/expandCurrentBranch
-      // и не меняем fold-состояние редактора.
-      if (!hiddenByPanel && hasChildren.has(h.line) && this.isPanelCollapsed(h)) {
-        collapsedStack.push({ level: h.level, line: h.line });
-      }
-    }
-
-    return visible;
-  }
-
   openItemContextMenu(heading, x, y) {
     const m = new Menu();
     m.addItem((it) => it.setTitle("Перейти").setIcon("arrow-right-circle")
       .onClick(() => this.plugin.jumpToHeading(this.fileForRender, heading.line)));
     m.addSeparator();
-    m.addItem((it) => it.setTitle("Свернуть в панели").onClick(() => {
-      this.setPanelHeadingCollapsed(heading, true);
+    m.addItem((it) => it.setTitle("Свернуть ветку").onClick(async () => {
+      await this.plugin.jumpToHeading(this.fileForRender, heading.line);
+      await sleep(30);
+      this.plugin.collapseCurrentBranch();
     }));
-    m.addItem((it) => it.setTitle("Развернуть в панели").onClick(() => {
-      this.setPanelHeadingCollapsed(heading, false);
+    m.addItem((it) => it.setTitle("Развернуть ветку").onClick(async () => {
+      await this.plugin.jumpToHeading(this.fileForRender, heading.line);
+      await sleep(30);
+      this.plugin.expandCurrentBranch();
     }));
     m.addSeparator();
     m.addItem((it) => it.setTitle("Ветку выше").onClick(async () => {
@@ -2598,12 +2778,12 @@ class StructurePanelView extends ItemView {
     m.addItem((it) => it.setTitle("Повысить").onClick(async () => {
       await this.plugin.jumpToHeading(this.fileForRender, heading.line);
       await sleep(30);
-      this.plugin.shiftLineAtCursor(-1);
+      this.plugin.shiftCurrentBranch(-1);
     }));
     m.addItem((it) => it.setTitle("Понизить").onClick(async () => {
       await this.plugin.jumpToHeading(this.fileForRender, heading.line);
       await sleep(30);
-      this.plugin.shiftLineAtCursor(1);
+      this.plugin.shiftCurrentBranch(1);
     }));
     m.addSeparator();
     m.addItem((it) => it.setTitle("Экспорт ветки…").onClick(async () => {
@@ -2910,6 +3090,83 @@ class RenumberModal extends Modal {
   }
 }
 
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VaultRenumberModal — перенумерация заметок и папок vault.
+// ═══════════════════════════════════════════════════════════════════════════════
+class VaultRenumberModal extends Modal {
+  constructor(app, plugin, folder, action) {
+    super(app);
+    this.plugin = plugin;
+    this.folder = folder;
+    this.action = action || "renumber";
+    this.targets = plugin.settings.vaultNumberingTargets || "both";
+    this.order = plugin.settings.vaultNumberingOrder || "folders-first";
+    this.style = plugin.settings.vaultNumberingStyle || "decimal_2_underscore";
+    this.stripOld = plugin.settings.vaultStripOldNumbering !== false;
+    this.customTemplate = plugin.settings.vaultCustomTemplate || "{N}_{title}";
+    this.zeroPad = plugin.settings.vaultCustomZeroPad || 2;
+    this.marker = plugin.settings.vaultCustomMarker || "•";
+  }
+  onOpen() {
+    const el = this.contentEl;
+    el.empty();
+    el.addClass("structure-commander-small-modal");
+    el.createEl("h2", { text: this.action === "remove" ? "Удалить нумерацию vault" : "Перенумеровать vault" });
+    el.createDiv({ cls: "structure-commander-muted", text: "Папка: " + (this.folder.path || "/") });
+    this.radioGroup(el, "Что менять", "scmd-vault-targets", [["both","Заметки и папки"],["notes","Только заметки .md"],["folders","Только папки"]], this.targets, (v) => { this.targets = v; this.refreshPreview(); });
+    this.radioGroup(el, "Порядок", "scmd-vault-order", [["folders-first","Сначала папки"],["notes-first","Сначала заметки"],["name","По имени"]], this.order, (v) => { this.order = v; this.refreshPreview(); });
+    if (this.action !== "remove") {
+      new Setting(el).setName("Стиль").setDesc("Для файлов нет точек и скобок. Только безопасные префиксы.").addDropdown((dd) => {
+        VAULT_NUMBERING_STYLES.forEach((s) => dd.addOption(s.id, s.label));
+        dd.setValue(this.style);
+        dd.onChange((v) => { this.style = v; this.refreshCustomVisibility(); this.refreshPreview(); });
+      });
+      this.customBlock = el.createDiv({ cls: "structure-commander-section" });
+      this.customBlock.createEl("h3", { text: "Пользовательский шаблон" });
+      new Setting(this.customBlock).setName("Шаблон").setDesc("Обязателен {title}. Для порядка нужен {n}, {N}, {a}, {A}, {ru}, {RU}, {i} или {I}.").addText((t) => t.setValue(this.customTemplate).onChange((v) => { this.customTemplate = v || "{N}_{title}"; this.refreshPreview(); }));
+      new Setting(this.customBlock).setName("Разрядность {N}").addText((t) => t.setValue(String(this.zeroPad)).onChange((v) => { this.zeroPad = Math.max(1, Math.min(4, parseInt(v, 10) || 2)); this.refreshPreview(); }));
+      new Setting(this.customBlock).setName("Маркер {mark}").addText((t) => t.setValue(this.marker).onChange((v) => { this.marker = v || "•"; this.refreshPreview(); }));
+    }
+    new Setting(el).setName("Удалять старую служебную нумерацию перед новой").addToggle((tg) => tg.setValue(this.stripOld).onChange((v) => { this.stripOld = v; this.refreshPreview(); }));
+    this.previewBox = el.createDiv({ cls: "structure-commander-preview" });
+    this.previewBox.createEl("h3", { text: "Предпросмотр" });
+    this.previewList = this.previewBox.createDiv({ cls: "structure-preview-list" });
+    this.previewCount = this.previewBox.createDiv({ cls: "structure-commander-muted" });
+    const btns = el.createDiv({ cls: "structure-modal-buttons" });
+    const ok = btns.createEl("button", { text: "Применить" }); ok.addClass("mod-cta"); ok.onclick = () => this.submit();
+    btns.createEl("button", { text: "Отмена" }).onclick = () => this.close();
+    this.refreshCustomVisibility(); this.refreshPreview();
+  }
+  radioGroup(parent, title, name, options, selected, onChange) {
+    const w = parent.createDiv({ cls: "structure-radio-block" }); w.createDiv({ cls: "structure-radio-title", text: title });
+    options.forEach((o) => { const lab = w.createEl("label"); const inp = lab.createEl("input", { type: "radio" }); inp.name = name; inp.value = o[0]; inp.checked = selected === o[0]; inp.onchange = () => onChange(o[0]); lab.createSpan({ text: " " + o[1] }); });
+  }
+  refreshCustomVisibility() { if (this.customBlock) this.customBlock.style.display = this.style === "custom" ? "block" : "none"; }
+  getOptions() { return { action: this.action, targets: this.targets, order: this.order, style: this.style, stripOld: this.stripOld, customTemplate: this.customTemplate, zeroPad: this.zeroPad, marker: this.marker }; }
+  refreshPreview() {
+    if (!this.previewList) return; this.previewList.empty();
+    if (this.style === "custom") { const err = validateVaultCustomTemplate(this.customTemplate); if (err) { this.previewCount.setText(err); return; } }
+    const plan = this.plugin.collectVaultRenamePlan(this.folder, this.getOptions());
+    const err = this.plugin.validateVaultRenamePlan(plan); if (err) { this.previewCount.setText(err); return; }
+    if (!plan.length) { this.previewCount.setText("Нечего менять."); return; }
+    plan.slice(0, 10).forEach((p) => { const row = this.previewList.createDiv({ cls: "structure-preview-row" }); row.createDiv({ cls: "structure-preview-before", text: p.oldName }); row.createDiv({ cls: "structure-preview-arrow", text: "→" }); row.createDiv({ cls: "structure-preview-after", text: p.newName }); });
+    this.previewCount.setText("Будет изменено: " + plan.length + (plan.length > 10 ? " (показаны первые 10)" : ""));
+  }
+  async submit() {
+    if (this.style === "custom") { const err = validateVaultCustomTemplate(this.customTemplate); if (err) { new Notice(err); return; } }
+    const opts = this.getOptions();
+    const plan = this.plugin.collectVaultRenamePlan(this.folder, opts);
+    const ok = await this.plugin.applyVaultRenamePlan(plan, { label: this.action === "remove" ? "Удаление нумерации vault" : "Нумерация vault" });
+    if (ok) {
+      this.plugin.settings.vaultNumberingTargets = this.targets; this.plugin.settings.vaultNumberingOrder = this.order; this.plugin.settings.vaultNumberingStyle = this.style; this.plugin.settings.vaultStripOldNumbering = this.stripOld; this.plugin.settings.vaultCustomTemplate = this.customTemplate; this.plugin.settings.vaultCustomZeroPad = this.zeroPad; this.plugin.settings.vaultCustomMarker = this.marker;
+      await this.plugin.saveSettings(); this.close();
+    }
+  }
+  onClose() { this.contentEl.empty(); }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Settings tab.
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2959,6 +3216,21 @@ class StructureCommanderSettingTab extends PluginSettingTab {
             this.plugin.syncAllToolbars();
           });
       });
+
+    new Setting(containerEl)
+      .setName("Управление деревом vault хоткеями")
+      .setDesc("Если фокус в файловом дереве, Alt+Shift+стрелки работают с файлами и папками.")
+      .addToggle((tg) => tg.setValue(this.plugin.settings.vaultOrderEnabled !== false).onChange(async (v) => { this.plugin.settings.vaultOrderEnabled = v; await this.plugin.saveSettings(); }));
+
+    new Setting(containerEl)
+      .setName("Режим отработки файловых операций")
+      .setDesc("Показывает план в консоли и не переименовывает файлы.")
+      .addToggle((tg) => tg.setValue(!!this.plugin.settings.vaultDryRun).onChange(async (v) => { this.plugin.settings.vaultDryRun = v; await this.plugin.saveSettings(); }));
+
+    new Setting(containerEl)
+      .setName("Стиль нумерации vault по умолчанию")
+      .addDropdown((dd) => { VAULT_NUMBERING_STYLES.forEach((st) => dd.addOption(st.id, st.label)); dd.setValue(this.plugin.settings.vaultNumberingStyle || "decimal_2_underscore"); dd.onChange(async (v) => { this.plugin.settings.vaultNumberingStyle = v; await this.plugin.saveSettings(); }); })
+      .addButton((b) => b.setButtonText("Перенумеровать vault…").onClick(() => this.plugin.openVaultRenumberModal("renumber")));
 
     new Setting(containerEl)
       .setName("Папка экспорта")
@@ -3048,6 +3320,16 @@ class StructureCommanderSettingTab extends PluginSettingTab {
         ["open-structure-panel-bottom", "Открыть панель структуры снизу"],
         ["toggle-structure-panel",      "Скрыть/показать боковую панель"],
         ["toggle-editor-toolbar",       "Скрыть/показать панель инструментов"]
+      ]],
+      ["Vault: файлы и папки", [
+        ["renumber-vault-folder", "Пронумеровать текущую папку vault"],
+        ["remove-vault-numbering", "Удалить нумерацию текущей папки vault"],
+        ["move-vault-item-up", "Файл/папка выше"],
+        ["move-vault-item-down", "Файл/папка ниже"],
+        ["promote-vault-item", "Файл/папка на уровень выше"],
+        ["demote-vault-item", "Файл/папка внутрь предыдущей папки"],
+        ["undo-vault-operation", "Отменить файловую операцию"],
+        ["redo-vault-operation", "Повторить файловую операцию"]
       ]],
       ["Прочее", [
         ["promote-current-heading",     "Повысить только текущий заголовок"],
@@ -3156,10 +3438,6 @@ function sleep(ms) { return new Promise((r) => window.setTimeout(r, ms)); }
 
 function clamp(v, mn, mx) { return Math.max(mn, Math.min(mx, v)); }
 
-function indentWidth(s) {
-  return String(s || "").replace(/\t/g, "    ").length;
-}
-
 function truncate(s, n) {
   s = String(s || "");
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
@@ -3221,6 +3499,65 @@ function emojiNumber(n) {
 
 function emojiPath(path) {
   return path.map((n) => emojiNumber(n)).join(".");
+}
+
+
+
+function splitVaultName(file) {
+  const name = String(file && file.name ? file.name : "");
+  if (file instanceof TFolder) return { base: name, ext: "" };
+  const idx = name.lastIndexOf(".");
+  if (idx > 0) return { base: name.slice(0, idx), ext: name.slice(idx) };
+  return { base: name, ext: "" };
+}
+function stripVaultNumberingPrefix(name) {
+  let v = String(name || "").trim();
+  v = v.replace(/^\d{1,4}_\s*/, "");
+  v = v.replace(/^(?:[A-Za-z]|[А-Яа-я])_\s*/, "");
+  v = v.replace(/^(?:M|CM|D|CD|C|XC|L|XL|X|IX|V|IV|I|m|cm|d|cd|c|xc|l|xl|x|ix|v|iv|i)+_\s*/, "");
+  v = v.replace(/^(?:[-•])\s+/, "");
+  return v.trim() || String(name || "").trim();
+}
+function makeVaultNumberedBase(title, index, styleId, options) {
+  title = String(title || "").trim();
+  switch (styleId) {
+    case "none": return title;
+    case "decimal_2_underscore": return String(index).padStart(2, "0") + "_" + title;
+    case "decimal_3_underscore": return String(index).padStart(3, "0") + "_" + title;
+    case "latin_upper_underscore": return alphaByIndex(index, VAULT_LATIN_UPPER) + "_" + title;
+    case "latin_lower_underscore": return alphaByIndex(index, VAULT_LATIN_LOWER) + "_" + title;
+    case "cyrillic_upper_underscore": return alphaByIndex(index, VAULT_CYRILLIC_UPPER) + "_" + title;
+    case "cyrillic_lower_underscore": return alphaByIndex(index, VAULT_CYRILLIC_LOWER) + "_" + title;
+    case "roman_upper_underscore": return toRoman(index).toUpperCase() + "_" + title;
+    case "roman_lower_underscore": return toRoman(index).toLowerCase() + "_" + title;
+    case "dash_marker": return "- " + title;
+    case "bullet_marker": return "• " + title;
+    case "custom": return applyVaultCustomTemplate(title, index, options || {});
+    default: return String(index).padStart(2, "0") + "_" + title;
+  }
+}
+function alphaByIndex(index, alphabet) {
+  let n = index, out = "";
+  while (n > 0) { n--; out = alphabet[n % alphabet.length] + out; n = Math.floor(n / alphabet.length); }
+  return out;
+}
+function toRoman(num) {
+  const map = [[1000,"M"],[900,"CM"],[500,"D"],[400,"CD"],[100,"C"],[90,"XC"],[50,"L"],[40,"XL"],[10,"X"],[9,"IX"],[5,"V"],[4,"IV"],[1,"I"]];
+  let n = Math.max(1, Math.min(3999, Number(num) || 1)); let res = "";
+  for (const [v, s] of map) while (n >= v) { res += s; n -= v; }
+  return res;
+}
+function validateVaultCustomTemplate(tpl) {
+  tpl = String(tpl || "");
+  if (!tpl.includes("{title}")) return "В шаблоне обязателен токен {title}";
+  if (/[\\/:*?"<>|]/.test(tpl)) return "Шаблон содержит запрещённые для имени файла символы";
+  return "";
+}
+function applyVaultCustomTemplate(title, index, options) {
+  const tpl = String(options.customTemplate || "{N}_{title}");
+  const pad = Math.max(1, Math.min(4, Number(options.zeroPad) || 2));
+  const marker = String(options.marker || "•");
+  return tpl.replaceAll("{title}", title).replaceAll("{n}", String(index)).replaceAll("{N}", String(index).padStart(pad, "0")).replaceAll("{a}", alphaByIndex(index, VAULT_LATIN_LOWER)).replaceAll("{A}", alphaByIndex(index, VAULT_LATIN_UPPER)).replaceAll("{ru}", alphaByIndex(index, VAULT_CYRILLIC_LOWER)).replaceAll("{RU}", alphaByIndex(index, VAULT_CYRILLIC_UPPER)).replaceAll("{i}", toRoman(index).toLowerCase()).replaceAll("{I}", toRoman(index).toUpperCase()).replaceAll("{mark}", marker);
 }
 
 function formatHotkey(hotkey) {

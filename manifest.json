@@ -1,9 +1,9 @@
 {
   "id": "structure-commander",
   "name": "Structure Commander",
-  "version": "2.3.1",
+  "version": "2.3.4",
   "minAppVersion": "1.0.0",
-  "description": "Manage Markdown structure as a tree: move branches, change heading levels, fold sections, renumber outlines, export branches, and navigate long notes.",
-  "author": "Andrey Kudlay",
+  "description": "Управление Markdown-структурой и порядком заметок/папок vault: ветки, уровни, сворачивание, перенумерация, экспорт, боковая панель, сохранение выделения при переносе.",
+  "author": "Structure Commander",
   "isDesktopOnly": false
 }
